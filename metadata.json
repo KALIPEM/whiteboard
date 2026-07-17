@@ -1,0 +1,5 @@
+{
+  "name": "Minimal Whiteboard",
+  "description": "A clean, minimal whiteboard app with markers, colors, eraser, and text support.",
+  "requestFramePermissions": []
+}
