@@ -618,7 +618,7 @@ export default function Whiteboard() {
               <button onClick={redo} disabled={historyStep === history.length - 1} className="p-1 rounded hover:bg-gray-100 disabled:opacity-30" title="Redo"><Redo size={16}/></button>
           </div>
           <div className="flex items-center gap-2">
-            <span className="text-xs text-gray-400">Shift+RightClick to Ping</span>
+            
           </div>
         </div>
         
