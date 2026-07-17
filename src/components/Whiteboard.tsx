@@ -2,7 +2,7 @@ import React, { useState, useRef, useEffect } from 'react';
 import { Stage, Layer, Line, Text as KonvaText, Rect, Circle as KonvaCircle, Ellipse as KonvaEllipse, Image as KonvaImage, Transformer, Arrow, Path, Group } from 'react-konva';
 import { v4 as uuidv4 } from 'uuid';
 import { TOOLS, ToolType, COLORS } from '../constants';
-import { Eraser, Pen, Highlighter, Type, Trash2, Download, Circle, Minus, Image as ImageIcon, MousePointer2, X, Scissors, Square, Undo, Redo } from 'lucide-react';
+import { Eraser, Pen, Highlighter, Type, Trash2, Download, Circle, Minus, Image as ImageIcon, MousePointer2, X, Scissors, Square, Undo, Redo, Info } from 'lucide-react';
 
 interface LineData {
   id: string;
@@ -32,7 +32,9 @@ interface ShapeData {
   y: number;
   width?: number; 
   height?: number;
-  points?: number[]; 
+  points?: number[];
+  sides?: number;
+  isRegular?: boolean;
   color: string;
   strokeWidth: number;
   timestamp: number;
@@ -68,6 +70,9 @@ export default function Whiteboard() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [currentLasso, setCurrentLasso] = useState<number[]>([]);
   const [pointers, setPointers] = useState<{x: number, y: number, color: string, id: string}[]>([]);
+  const [polygonSides, setPolygonSides] = useState<number>(4);
+  const [showInfo, setShowInfo] = useState<boolean>(false);
+
   
   const isDrawing = useRef(false);
   
@@ -175,7 +180,24 @@ export default function Whiteboard() {
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key >= '3' && e.key <= '9') {
+        setPolygonSides(parseInt(e.key));
+      }
+      
       if (textInput) return; // Don't delete or undo if typing
+      
+      const key = e.key.toLowerCase();
+      if (!e.ctrlKey && !e.metaKey && !e.altKey) {
+        if (key === 'v') setTool(TOOLS.SELECT);
+        else if (key === 'p') setTool(TOOLS.PEN);
+        else if (key === 'm') setTool(TOOLS.MARKER);
+        else if (key === 'e') setTool(TOOLS.ERASER);
+        else if (key === 'r') setTool(TOOLS.AREA_ERASER);
+        else if (key === 't') setTool(TOOLS.TEXT);
+        else if (key === 'l') setTool(TOOLS.LINE);
+        else if (key === 'a') setTool(TOOLS.RECTANGLE);
+        else if (key === 'c' || key === 's') setTool(TOOLS.CIRCLE);
+      }
       
       if ((e.key === 'Delete' || e.key === 'Backspace') && selectedId) {
          deleteSelected();
@@ -318,10 +340,10 @@ export default function Whiteboard() {
         strokeWidth,
         timestamp: Date.now(),
       }]);
-    } else if (tool === TOOLS.CIRCLE || tool === TOOLS.ELLIPSE) {
+    } else if (tool === TOOLS.CIRCLE) {
       setShapes([...shapes, {
         id,
-        type: tool === TOOLS.CIRCLE ? 'circle' : 'ellipse',
+        type: 'ellipse',
         x: pos.x,
         y: pos.y,
         width: 0,
@@ -341,6 +363,8 @@ export default function Whiteboard() {
         color,
         strokeWidth,
         timestamp: Date.now(),
+        sides: polygonSides,
+        isRegular: e.evt.ctrlKey || e.evt.metaKey
       }]);
     } else {
       setLines([...lines, {
@@ -378,28 +402,38 @@ export default function Whiteboard() {
       setShapes(newShapes);
     } else if (tool === TOOLS.CIRCLE) {
       const lastShape = shapes[shapes.length - 1];
-      if (!lastShape || lastShape.type !== 'circle') return;
-
-      const dx = pos.x - lastShape.x;
-      const dy = pos.y - lastShape.y;
-      const radius = Math.sqrt(dx * dx + dy * dy);
-
-      const newShapes = [...shapes];
-      newShapes[shapes.length - 1] = { ...lastShape, width: radius * 2, height: radius * 2 };
-      setShapes(newShapes);
-    } else if (tool === TOOLS.ELLIPSE) {
-      const lastShape = shapes[shapes.length - 1];
       if (!lastShape || lastShape.type !== 'ellipse') return;
 
       const newShapes = [...shapes];
-      newShapes[shapes.length - 1] = { ...lastShape, width: Math.abs(pos.x - lastShape.x) * 2, height: Math.abs(pos.y - lastShape.y) * 2 };
+      let width = Math.abs(pos.x - lastShape.x) * 2;
+      let height = Math.abs(pos.y - lastShape.y) * 2;
+      
+      if (e.evt.ctrlKey || e.evt.metaKey) {
+        const dx = pos.x - lastShape.x;
+        const dy = pos.y - lastShape.y;
+        const radius = Math.sqrt(dx * dx + dy * dy);
+        width = radius * 2;
+        height = radius * 2;
+      }
+
+      newShapes[shapes.length - 1] = { ...lastShape, width, height };
       setShapes(newShapes);
     } else if (tool === TOOLS.RECTANGLE) {
       const lastShape = shapes[shapes.length - 1];
       if (!lastShape || lastShape.type !== 'rectangle') return;
 
       const newShapes = [...shapes];
-      newShapes[shapes.length - 1] = { ...lastShape, width: pos.x - lastShape.x, height: pos.y - lastShape.y };
+      let width = pos.x - lastShape.x;
+      let height = pos.y - lastShape.y;
+      const isRegular = e.evt.ctrlKey || e.evt.metaKey;
+
+      if (isRegular) {
+        const size = Math.max(Math.abs(width), Math.abs(height));
+        width = width < 0 ? -size : size;
+        height = height < 0 ? -size : size;
+      }
+
+      newShapes[shapes.length - 1] = { ...lastShape, width, height, isRegular };
       setShapes(newShapes);
     } else {
       const lastLine = lines[lines.length - 1];
@@ -642,23 +676,16 @@ export default function Whiteboard() {
             <button
               onClick={() => setTool(TOOLS.RECTANGLE)}
               className={`p-2 rounded-lg transition-colors ${tool === TOOLS.RECTANGLE ? 'bg-blue-100 text-blue-600' : 'hover:bg-gray-100 text-gray-600'}`}
-              title="Rectangle"
+              title="Rectangle / Polygon (Press 3-9 for sides, Hold Ctrl/Cmd for regular)"
             >
               <Square size={20} />
             </button>
             <button
               onClick={() => setTool(TOOLS.CIRCLE)}
               className={`p-2 rounded-lg transition-colors ${tool === TOOLS.CIRCLE ? 'bg-blue-100 text-blue-600' : 'hover:bg-gray-100 text-gray-600'}`}
-              title="Circle"
+              title="Circle / Ellipse (Hold Ctrl/Cmd for perfect circle)"
             >
               <Circle size={20} />
-            </button>
-            <button
-              onClick={() => setTool(TOOLS.ELLIPSE)}
-              className={`p-2 rounded-lg transition-colors ${tool === TOOLS.ELLIPSE ? 'bg-blue-100 text-blue-600' : 'hover:bg-gray-100 text-gray-600'}`}
-              title="Ellipse"
-            >
-              <div className="w-4 h-3 border-[1.5px] border-current rounded-[50%]"></div>
             </button>
             <label className="p-2 rounded-lg hover:bg-gray-100 text-gray-600 cursor-pointer transition-colors" title="Upload Image">
               <ImageIcon size={20} />
@@ -836,6 +863,44 @@ export default function Whiteboard() {
                     />
                   );
                 } else if (el.item.type === 'rectangle') {
+                  const sides = el.item.sides || 4;
+                  if (sides !== 4) {
+                    const getPolygonPoints = (sidesCount: number, w: number, h: number) => {
+                      const pts = [];
+                      const rx = Math.abs(w) / 2;
+                      const ry = Math.abs(h) / 2;
+                      const cx = w / 2;
+                      const cy = h / 2;
+                      for (let i = 0; i < sidesCount; i++) {
+                        const angle = (i * 2 * Math.PI) / sidesCount - Math.PI / 2;
+                        pts.push(cx + rx * Math.cos(angle));
+                        pts.push(cy + ry * Math.sin(angle));
+                      }
+                      return pts;
+                    };
+                    return (
+                      <Line
+                        key={el.item.id}
+                        id={el.item.id}
+                        x={el.item.x}
+                        y={el.item.y}
+                        points={getPolygonPoints(sides, el.item.width || 0, el.item.height || 0)}
+                        closed={true}
+                        stroke={el.item.color}
+                        strokeWidth={el.item.strokeWidth}
+                        draggable={tool === TOOLS.SELECT}
+                        onClick={() => {
+                          if (tool === TOOLS.SELECT) setSelectedId(el.item.id);
+                        }}
+                        onTap={() => {
+                          if (tool === TOOLS.SELECT) setSelectedId(el.item.id);
+                        }}
+                        onDragEnd={(e) => handleDragEnd(e, el.item.id, 'shape')}
+                        onTransformEnd={(e) => handleTransformEnd(e, el.item.id, 'shape')}
+                      />
+                    );
+                  }
+                  
                   return (
                     <Rect
                       key={el.item.id}
@@ -919,21 +984,18 @@ export default function Whiteboard() {
             })}
             
             {pointers.map(p => (
-                 <Path
+                 <Arrow
                     key={p.id}
-                    x={p.x}
-                    y={p.y}
-                    data="M 0 0 L 0 16 L 4 12 L 9 20 L 12 18 L 7 10 L 12 10 Z"
+                    points={[p.x + 20, p.y + 20, p.x, p.y]}
+                    pointerLength={10}
+                    pointerWidth={10}
                     fill="#000000"
-                    stroke="#ffffff"
-                    strokeWidth={2}
-                    opacity={1}
+                    stroke="#000000"
+                    strokeWidth={3}
                     shadowColor="black"
-                    shadowBlur={3}
+                    shadowBlur={2}
                     shadowOffset={{ x: 1, y: 1 }}
                     shadowOpacity={0.3}
-                    scaleX={1.2}
-                    scaleY={1.2}
                     onContextMenu={(e) => {
                       e.cancelBubble = true;
                       e.evt.preventDefault();
@@ -984,6 +1046,38 @@ export default function Whiteboard() {
             autoFocus
           />
         )}
+      </div>
+
+      {/* Info Button */}
+      <div className="absolute bottom-4 right-4 z-10 flex flex-col items-end gap-2">
+        {showInfo && (
+          <div className="bg-white p-4 rounded-xl shadow-lg border border-gray-200 text-sm w-80 mb-2">
+            <div className="flex justify-between items-center mb-3">
+               <h3 className="font-bold text-gray-800">Shortcuts & Controls</h3>
+               <button onClick={() => setShowInfo(false)} className="text-gray-500 hover:text-gray-800"><X size={16}/></button>
+            </div>
+            <ul className="space-y-2 text-gray-600 text-xs">
+               <li><strong>v, p, m, e:</strong> Select, Pen, Marker, Eraser</li>
+               <li><strong>x, t, l, a:</strong> Area Eraser, Text, Line, Rectangle</li>
+               <li><strong>c / s:</strong> Circle / Ellipse</li>
+               <li><strong>Delete / Backspace:</strong> Delete selected object</li>
+               <li><strong>Ctrl/Cmd + z:</strong> Undo</li>
+               <li><strong>Ctrl/Cmd + y:</strong> Redo</li>
+               <li><strong>Shift + Click:</strong> Create ping arrow</li>
+               <li><strong>Right Click (on ping):</strong> Remove ping arrow</li>
+               <li><strong>Ctrl/Cmd + v:</strong> Paste image</li>
+               <li><strong>3-9:</strong> Polygon sides (while in Rectangle tool)</li>
+               <li><strong>Ctrl/Cmd (Hold):</strong> Regular shape (Square, Equilateral, etc.)</li>
+            </ul>
+          </div>
+        )}
+        <button 
+           onClick={() => setShowInfo(!showInfo)} 
+           className="bg-white p-3 rounded-full shadow-lg border border-gray-200 hover:bg-gray-50 text-gray-600 transition-colors"
+           title="Shortcuts & Info"
+        >
+           <Info size={24} />
+        </button>
       </div>
     </div>
   );

@@ -17,7 +17,6 @@ export const TOOLS = {
   LINE: 'line',
   CIRCLE: 'circle',
   RECTANGLE: 'rectangle',
-  ELLIPSE: 'ellipse',
 } as const;
 
 export type ToolType = (typeof TOOLS)[keyof typeof TOOLS];
