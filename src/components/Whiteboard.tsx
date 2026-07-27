@@ -119,7 +119,11 @@ export default function Whiteboard() {
 
   useEffect(() => {
     if (textInput && textInputRef.current) {
-      textInputRef.current.focus();
+      if (document.activeElement !== textInputRef.current) {
+        setTimeout(() => {
+          textInputRef.current?.focus();
+        }, 50);
+      }
     }
   }, [textInput]);
 
@@ -312,7 +316,7 @@ export default function Whiteboard() {
     }
     
     // Check if shift is held for ping (left click)
-    if (e.evt.shiftKey) {
+    if (e.evt.shiftKey && tool !== TOOLS.ERASER) {
       const stage = e.target.getStage();
       if (!stage) return;
       const ptr = stage.getPointerPosition();
@@ -345,18 +349,34 @@ export default function Whiteboard() {
 
     if (tool === TOOLS.SELECT) return;
 
-    if (tool === TOOLS.AREA_ERASER) {
-      setCurrentLasso([pos.x, pos.y]);
-      isDrawing.current = true;
-      return;
-    }
-
     if (tool === TOOLS.TEXT) {
-      setTextInput({ x: pos.x, y: pos.y, value: '' });
+      console.log("Creating text input at", pos.x, pos.y);
+      setTextInput({ x: pos.x, y: pos.y, value: '', _createdAt: Date.now() } as any);
       return;
     }
 
     isDrawing.current = true;
+
+    if (tool === TOOLS.ERASER && e.evt.shiftKey) {
+      const shape = stage.getIntersection(ptr);
+      if (shape && shape.name() !== 'background') {
+        const id = shape.id();
+        if (id) {
+          setLines(prev => prev.filter(l => l.id !== id));
+          setShapes(prev => prev.filter(s => s.id !== id));
+          setTexts(prev => prev.filter(t => t.id !== id));
+          setImages(prev => prev.filter(i => i.id !== id));
+          setShouldSaveHistory(true);
+        }
+      }
+      return;
+    }
+
+    if (tool === TOOLS.AREA_ERASER) {
+      setCurrentLasso([pos.x, pos.y]);
+      return;
+    }
+
     const id = uuidv4();
     
     let strokeWidth = tool === TOOLS.PEN ? penThickness : 2;
@@ -370,18 +390,6 @@ export default function Whiteboard() {
         x: 0,
         y: 0,
         points: [pos.x, pos.y, pos.x, pos.y],
-        color,
-        strokeWidth,
-        timestamp: Date.now(),
-      }]);
-    } else if (tool === TOOLS.CIRCLE) {
-      setShapes([...shapes, {
-        id,
-        type: 'ellipse',
-        x: pos.x,
-        y: pos.y,
-        width: 0,
-        height: 0,
         color,
         strokeWidth,
         timestamp: Date.now(),
@@ -400,6 +408,19 @@ export default function Whiteboard() {
         sides: polygonSides,
         isRegular: e.evt.ctrlKey || e.evt.metaKey
       }]);
+    } else if (tool === TOOLS.CIRCLE) {
+      setShapes([...shapes, {
+        id,
+        type: 'ellipse',
+        x: pos.x,
+        y: pos.y,
+        width: 0,
+        height: 0,
+        color,
+        strokeWidth,
+        timestamp: Date.now(),
+        isRegular: e.evt.ctrlKey || e.evt.metaKey
+      }]);
     } else {
       setLines([...lines, {
         id,
@@ -411,7 +432,6 @@ export default function Whiteboard() {
       }]);
     }
   };
-
   const handleMouseMove = (e: any) => {
     if (!isDrawing.current) return;
     
@@ -421,6 +441,21 @@ export default function Whiteboard() {
     const ptr = stage.getPointerPosition();
     if (!ptr) return;
     const pos = { x: (ptr.x - stage.x()) / stage.scaleX(), y: (ptr.y - stage.y()) / stage.scaleY() };
+
+    if (tool === TOOLS.ERASER && e.evt.shiftKey) {
+      const shape = stage.getIntersection(ptr);
+      if (shape && shape.name() !== 'background') {
+        const id = shape.id();
+        if (id) {
+          setLines(prev => prev.filter(l => l.id !== id));
+          setShapes(prev => prev.filter(s => s.id !== id));
+          setTexts(prev => prev.filter(t => t.id !== id));
+          setImages(prev => prev.filter(i => i.id !== id));
+          setShouldSaveHistory(true);
+        }
+      }
+      return;
+    }
 
     if (tool === TOOLS.AREA_ERASER) {
       setCurrentLasso(prev => [...prev, pos.x, pos.y]);
@@ -438,7 +473,6 @@ export default function Whiteboard() {
     } else if (tool === TOOLS.CIRCLE) {
       const lastShape = shapes[shapes.length - 1];
       if (!lastShape || lastShape.type !== 'ellipse') return;
-
       const newShapes = [...shapes];
       let width = Math.abs(pos.x - lastShape.x) * 2;
       let height = Math.abs(pos.y - lastShape.y) * 2;
@@ -450,36 +484,31 @@ export default function Whiteboard() {
         width = radius * 2;
         height = radius * 2;
       }
-
       newShapes[shapes.length - 1] = { ...lastShape, width, height };
       setShapes(newShapes);
     } else if (tool === TOOLS.RECTANGLE) {
       const lastShape = shapes[shapes.length - 1];
       if (!lastShape || lastShape.type !== 'rectangle') return;
-
       const newShapes = [...shapes];
       let width = pos.x - lastShape.x;
       let height = pos.y - lastShape.y;
-      const isRegular = e.evt.ctrlKey || e.evt.metaKey;
 
-      if (isRegular) {
-        const size = Math.max(Math.abs(width), Math.abs(height));
-        width = width < 0 ? -size : size;
-        height = height < 0 ? -size : size;
+      if (e.evt.ctrlKey || e.evt.metaKey) {
+         const size = Math.max(Math.abs(width), Math.abs(height));
+         width = width < 0 ? -size : size;
+         height = height < 0 ? -size : size;
       }
-
-      newShapes[shapes.length - 1] = { ...lastShape, width, height, isRegular };
+      newShapes[shapes.length - 1] = { ...lastShape, width, height };
       setShapes(newShapes);
     } else {
       const lastLine = lines[lines.length - 1];
       if (!lastLine) return;
-
+      
       lastLine.points = lastLine.points.concat([pos.x, pos.y]);
       lines.splice(lines.length - 1, 1, lastLine);
       setLines(lines.concat());
     }
   };
-
   const handleMouseUp = () => {
     if (isDrawing.current) {
         isDrawing.current = false;
@@ -506,7 +535,12 @@ export default function Whiteboard() {
     }
   };
 
-  const handleTextSubmit = () => {
+  const handleTextSubmit = (e?: React.FocusEvent) => {
+    // If we just focused it, ignore blur for a tiny bit
+    if (e && e.type === 'blur') {
+       if (Date.now() - (textInput as any)._createdAt < 100) return;
+    }
+    console.log("handleTextSubmit called, textInput:", textInput, "activeElement:", document.activeElement);
     if (!textInput) return;
     if (textInput.value.trim()) {
       setTexts([
@@ -821,7 +855,7 @@ export default function Whiteboard() {
       </div>
 
       {/* Canvas Container */}
-      <div className="flex-1 w-full h-full bg-white cursor-crosshair" ref={containerRef}>
+      <div className="flex-1 w-full h-full bg-white cursor-crosshair relative" ref={containerRef}>
         <Stage
           width={stageSize.width}
           height={stageSize.height}
@@ -864,12 +898,9 @@ export default function Whiteboard() {
             }
           }}
           onContextMenu={handleContextMenu}
-          onMouseDown={handleMouseDown}
-          onMousemove={handleMouseMove}
-          onMouseup={handleMouseUp}
-          onTouchStart={handleMouseDown}
-          onTouchMove={handleMouseMove}
-          onTouchEnd={handleMouseUp}
+          onPointerDown={handleMouseDown}
+          onPointerMove={handleMouseMove}
+          onPointerUp={handleMouseUp}
           ref={stageRef}
         >
           {/* Layer 1: Background and Permanent Images */}
@@ -1165,9 +1196,9 @@ export default function Whiteboard() {
             onKeyDown={handleKeyDown}
             style={{
               position: 'absolute',
-              top: textInput.y,
-              left: textInput.x,
-              fontSize: '20px',
+              top: textInput.y * stageScale + stagePos.y,
+              left: textInput.x * stageScale + stagePos.x,
+              fontSize: `${20 * stageScale}px`,
               fontFamily: 'sans-serif',
               color: color,
               border: '1px dashed #ccc',
@@ -1286,6 +1317,7 @@ export default function Whiteboard() {
                <li><strong>Ctrl/Cmd + v:</strong> Paste image</li>
                <li><strong>3-9:</strong> Polygon sides (while in Rectangle tool)</li>
                <li><strong>Ctrl/Cmd (Hold):</strong> Regular shape (Square, Equilateral, etc.)</li>
+               <li><strong>Shift + Drag (Eraser):</strong> Erase entire entity</li>
             </ul>
           </div>
         )}
