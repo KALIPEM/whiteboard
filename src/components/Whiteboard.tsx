@@ -1,8 +1,12 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { Stage, Layer, Line, Text as KonvaText, Rect, Circle as KonvaCircle, Ellipse as KonvaEllipse, Image as KonvaImage, Transformer, Arrow, Path, Group } from 'react-konva';
 import { v4 as uuidv4 } from 'uuid';
+import * as pdfjsLib from 'pdfjs-dist';
+// @ts-ignore
+import pdfWorker from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
+pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorker;
 import { TOOLS, ToolType, COLORS } from '../constants';
-import { Eraser, Pen, Highlighter, Type, Trash2, Download, Circle, Minus, Image as ImageIcon, MousePointer2, X, Scissors, Square, Undo, Redo, Info } from 'lucide-react';
+import { Hand, Eraser, Pen, Highlighter, Type, Trash2, Download, Circle, Minus, Image as ImageIcon, MousePointer2, X, Scissors, Square, Undo, Redo, Info } from 'lucide-react';
 
 interface LineData {
   id: string;
@@ -48,6 +52,7 @@ interface ImageData {
   width: number;
   height: number;
   timestamp: number;
+  isPermanent?: boolean;
 }
 
 interface HistoryState {
@@ -72,6 +77,8 @@ export default function Whiteboard() {
   const [pointers, setPointers] = useState<{x: number, y: number, color: string, id: string}[]>([]);
   const [polygonSides, setPolygonSides] = useState<number>(4);
   const [showInfo, setShowInfo] = useState<boolean>(false);
+  const [expandMenu, setExpandMenu] = useState<boolean>(false);
+  const [contextMenu, setContextMenu] = useState<{x: number, y: number, id: string} | null>(null);
 
   
   const isDrawing = useRef(false);
@@ -91,6 +98,8 @@ export default function Whiteboard() {
   // Canvas sizing
   const containerRef = useRef<HTMLDivElement>(null);
   const [stageSize, setStageSize] = useState({ width: window.innerWidth, height: window.innerHeight });
+  const [stagePos, setStagePos] = useState({ x: 0, y: 0 });
+  const [stageScale, setStageScale] = useState(1);
 
   useEffect(() => {
     const handleResize = () => {
@@ -126,6 +135,8 @@ export default function Whiteboard() {
       transformerRef.current.getLayer().batchDraw();
     }
   }, [selectedId, texts, shapes, lines, images]); 
+
+
 
   useEffect(() => {
     if (shouldSaveHistory) {
@@ -265,15 +276,36 @@ export default function Whiteboard() {
     if (e.evt.shiftKey) {
       const stage = e.target.getStage();
       if (!stage) return;
-      const pos = stage.getPointerPosition();
+      let pos = stage.getRelativePointerPosition();
+    if (!pos) {
+       const ptr = stage.getPointerPosition();
+       if (ptr) {
+         pos = { x: (ptr.x - stage.x()) / stage.scaleX(), y: (ptr.y - stage.y()) / stage.scaleY() };
+       }
+    }
       if (pos) {
         const id = uuidv4();
         setPointers([{ x: pos.x, y: pos.y, color: 'black', id }]);
+      }
+      return;
+    }
+
+    if (tool === TOOLS.SELECT) {
+      const clickedOnEmpty = e.target === e.target.getStage() || e.target.name() === 'background';
+      if (!clickedOnEmpty) {
+        const id = e.target.id();
+        if (id) {
+          setSelectedId(id);
+          setContextMenu({ x: e.evt.clientX, y: e.evt.clientY, id });
+        }
+      } else {
+        setContextMenu(null);
       }
     }
   };
 
   const handleMouseDown = (e: any) => {
+    setContextMenu(null);
     // Check right click
     if (e.evt.button === 2 || e.evt.button === 3) {
       return;
@@ -283,8 +315,9 @@ export default function Whiteboard() {
     if (e.evt.shiftKey) {
       const stage = e.target.getStage();
       if (!stage) return;
-      const pos = stage.getPointerPosition();
-      if (pos) {
+      const ptr = stage.getPointerPosition();
+      if (ptr) {
+        const pos = { x: (ptr.x - stage.x()) / stage.scaleX(), y: (ptr.y - stage.y()) / stage.scaleY() };
         const id = uuidv4();
         setPointers([{ x: pos.x, y: pos.y, color: 'black', id }]);
       }
@@ -300,8 +333,9 @@ export default function Whiteboard() {
     const stage = e.target.getStage();
     if (!stage) return;
     
-    const pos = stage.getPointerPosition();
-    if (!pos) return;
+    const ptr = stage.getPointerPosition();
+    if (!ptr) return;
+    const pos = { x: (ptr.x - stage.x()) / stage.scaleX(), y: (ptr.y - stage.y()) / stage.scaleY() };
 
     // If clicking outside text input while it's active, submit it
     if (textInput) {
@@ -384,8 +418,9 @@ export default function Whiteboard() {
     const stage = e.target.getStage();
     if (!stage) return;
     
-    const pos = stage.getPointerPosition();
-    if (!pos) return;
+    const ptr = stage.getPointerPosition();
+    if (!ptr) return;
+    const pos = { x: (ptr.x - stage.x()) / stage.scaleX(), y: (ptr.y - stage.y()) / stage.scaleY() };
 
     if (tool === TOOLS.AREA_ERASER) {
       setCurrentLasso(prev => [...prev, pos.x, pos.y]);
@@ -525,9 +560,59 @@ export default function Whiteboard() {
     }
   };
 
-  const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleImageUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (file) {
+    if (!file) return;
+
+    if (file.type === 'application/pdf') {
+      const url = URL.createObjectURL(file);
+      const loadingTask = pdfjsLib.getDocument({ url } as any);
+      const pdf = await loadingTask.promise;
+      let yOffset = 50;
+      
+      for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+        const page = await pdf.getPage(pageNum);
+        const viewport = page.getViewport({ scale: 1.5 });
+        const canvas = document.createElement('canvas');
+        const context = canvas.getContext('2d');
+        if (!context) continue;
+        canvas.height = viewport.height;
+        canvas.width = viewport.width;
+
+        await page.render({
+          canvasContext: context,
+          viewport: viewport
+        } as any).promise;
+
+        const img = new window.Image();
+        img.src = canvas.toDataURL();
+        
+        await new Promise((resolve) => {
+          img.onload = () => {
+            const maxSize = 800;
+            const scale = Math.min(maxSize / img.width, maxSize / img.height, 1);
+            const width = img.width * scale;
+            const height = img.height * scale;
+
+            setImages((prev) => [
+              ...prev,
+              {
+                id: uuidv4(),
+                image: img,
+                x: stageSize.width / 2 - width / 2,
+                y: yOffset,
+                width,
+                height,
+                timestamp: Date.now(),
+              },
+            ]);
+            yOffset += height + 20;
+            resolve(null);
+          };
+        });
+      }
+      setShouldSaveHistory(true);
+    } else {
       const img = new window.Image();
       img.src = URL.createObjectURL(file);
       img.onload = () => {
@@ -543,12 +628,11 @@ export default function Whiteboard() {
             image: img,
             x: stageSize.width / 2 - width / 2,
             y: stageSize.height / 2 - height / 2,
-            width: width,
-            height: height,
+            width,
+            height,
             timestamp: Date.now(),
           },
         ]);
-        setTool(TOOLS.SELECT);
         setShouldSaveHistory(true);
       };
     }
@@ -611,19 +695,19 @@ export default function Whiteboard() {
   return (
     <div className="relative w-full h-screen bg-gray-50 overflow-hidden flex flex-col">
       {/* Toolbar */}
-      <div className="absolute top-4 left-1/2 transform -translate-x-1/2 bg-white shadow-lg rounded-xl p-2 flex flex-col gap-2 z-10 border border-gray-200">
-        <div className="flex items-center justify-between border-b border-gray-100 pb-2 mb-1">
-          <div className="flex items-center gap-1">
-              <button onClick={undo} disabled={historyStep === 0} className="p-1 rounded hover:bg-gray-100 disabled:opacity-30" title="Undo"><Undo size={16}/></button>
-              <button onClick={redo} disabled={historyStep === history.length - 1} className="p-1 rounded hover:bg-gray-100 disabled:opacity-30" title="Redo"><Redo size={16}/></button>
-          </div>
-          <div className="flex items-center gap-2">
-            
-          </div>
-        </div>
-        
-        <div className="flex items-center gap-2">
+      <div className="absolute top-4 left-1/2 transform -translate-x-1/2 bg-white shadow-lg rounded-xl p-2 flex flex-row items-center gap-2 z-10 border border-gray-200">
           <div className="flex items-center gap-1 pr-2 border-r border-gray-200">
+              <button onClick={undo} disabled={historyStep === 0} className="p-2 rounded-lg hover:bg-gray-100 text-gray-600 transition-colors disabled:opacity-30" title="Undo"><Undo size={20}/></button>
+              <button onClick={redo} disabled={historyStep === history.length - 1} className="p-2 rounded-lg hover:bg-gray-100 text-gray-600 transition-colors disabled:opacity-30" title="Redo"><Redo size={20}/></button>
+          </div>
+          <div className="flex items-center gap-1 pr-2 border-r border-gray-200">
+            <button
+              onClick={() => setTool(TOOLS.PAN)}
+              className={`p-2 rounded-lg transition-colors ${tool === TOOLS.PAN ? 'bg-blue-100 text-blue-600' : 'hover:bg-gray-100 text-gray-600'}`}
+              title="Pan"
+            >
+              <Hand size={20} />
+            </button>
             <button
               onClick={() => setTool(TOOLS.SELECT)}
               className={`p-2 rounded-lg transition-colors ${tool === TOOLS.SELECT ? 'bg-blue-100 text-blue-600' : 'hover:bg-gray-100 text-gray-600'}`}
@@ -689,7 +773,7 @@ export default function Whiteboard() {
             </button>
             <label className="p-2 rounded-lg hover:bg-gray-100 text-gray-600 cursor-pointer transition-colors" title="Upload Image">
               <ImageIcon size={20} />
-              <input type="file" accept="image/*" className="hidden" onChange={handleImageUpload} />
+              <input type="file" accept="image/*,application/pdf" className="hidden" onChange={handleImageUpload} />
             </label>
           </div>
           <div className="flex items-center gap-2 px-2 border-r border-gray-200">
@@ -728,7 +812,6 @@ export default function Whiteboard() {
               <Download size={20} />
             </button>
           </div>
-        </div>
         {tool === TOOLS.PEN && (
           <div className="flex items-center gap-3 px-2 pt-1 pb-1">
              <span className="text-xs text-gray-500 font-medium">Thickness</span>
@@ -742,6 +825,44 @@ export default function Whiteboard() {
         <Stage
           width={stageSize.width}
           height={stageSize.height}
+          x={stagePos.x}
+          y={stagePos.y}
+          scaleX={stageScale}
+          scaleY={stageScale}
+          draggable={tool === TOOLS.PAN}
+          onDragEnd={(e) => {
+            if (e.target === e.target.getStage()) {
+              setStagePos({ x: e.target.x(), y: e.target.y() });
+            }
+          }}
+          onWheel={(e) => {
+            e.evt.preventDefault();
+            const stage = e.target.getStage();
+            if (!stage) return;
+            if (e.evt.ctrlKey || e.evt.metaKey) {
+              // Zoom
+              const scaleBy = 1.05;
+              const oldScale = stage.scaleX();
+              const pointer = stage.getPointerPosition();
+              if (!pointer) return;
+              const mousePointTo = {
+                x: (pointer.x - stage.x()) / oldScale,
+                y: (pointer.y - stage.y()) / oldScale,
+              };
+              const newScale = e.evt.deltaY < 0 ? oldScale * scaleBy : oldScale / scaleBy;
+              setStageScale(newScale);
+              setStagePos({
+                x: pointer.x - mousePointTo.x * newScale,
+                y: pointer.y - mousePointTo.y * newScale,
+              });
+            } else {
+              // Pan
+              setStagePos(prev => ({
+                x: prev.x - e.evt.deltaX,
+                y: prev.y - e.evt.deltaY
+              }));
+            }
+          }}
           onContextMenu={handleContextMenu}
           onMouseDown={handleMouseDown}
           onMousemove={handleMouseMove}
@@ -751,6 +872,7 @@ export default function Whiteboard() {
           onTouchEnd={handleMouseUp}
           ref={stageRef}
         >
+          {/* Layer 1: Background and Permanent Images */}
           <Layer>
              <Rect
                 name="background"
@@ -760,12 +882,26 @@ export default function Whiteboard() {
                 height={stageSize.height}
                 fill="white"
              />
-             
+             {images.filter(i => i.isPermanent).map(i => (
+                  <KonvaImage
+                    key={i.id}
+                    id={i.id}
+                    image={i.image}
+                    x={i.x}
+                    y={i.y}
+                    width={i.width}
+                    height={i.height}
+                    listening={false}
+                  />
+             ))}
+          </Layer>
+          {/* Layer 2: Drawings, Texts, Shapes, Normal Images */}
+          <Layer>
             {[
               ...lines.map(l => ({ type: 'lineItem', item: l as any })),
               ...shapes.map(s => ({ type: 'shapeItem', item: s as any })),
               ...texts.map(t => ({ type: 'textItem', item: t as any })),
-              ...images.map(i => ({ type: 'imageItem', item: i as any }))
+              ...images.filter(i => !i.isPermanent).map(i => ({ type: 'imageItem', item: i as any }))
             ]
             .sort((a, b) => (a.item.timestamp || 0) - (b.item.timestamp || 0))
             .map((el) => {
@@ -783,6 +919,7 @@ export default function Whiteboard() {
                     lineCap="round"
                     lineJoin="round"
                     opacity={el.item.tool === 'marker' ? 0.5 : 1}
+                    globalCompositeOperation={el.item.tool === 'eraser' ? 'destination-out' : 'source-over'}
                     draggable={tool === TOOLS.SELECT}
                     onClick={() => {
                       if (tool === TOOLS.SELECT) setSelectedId(el.item.id);
@@ -931,6 +1068,7 @@ export default function Whiteboard() {
                       fill="#ffffff"
                       closed
                       listening={false}
+                      globalCompositeOperation="destination-out"
                     />
                   );
                 }
@@ -1047,6 +1185,86 @@ export default function Whiteboard() {
           />
         )}
       </div>
+
+
+      {/* Context Menu */}
+      {contextMenu && (
+        <div 
+          className="absolute bg-white shadow-xl rounded-lg py-1 z-50 border border-gray-200 min-w-[160px]"
+          style={{ left: contextMenu.x, top: contextMenu.y }}
+          onContextMenu={(e) => e.preventDefault()}
+        >
+          <button 
+            onClick={() => {
+               const maxTimestamp = Math.max(
+                  ...lines.map(l => l.timestamp),
+                  ...shapes.map(s => s.timestamp),
+                  ...texts.map(t => t.timestamp),
+                  ...images.map(i => i.timestamp),
+                  0
+               );
+               setLines(prev => prev.map(l => l.id === contextMenu.id ? { ...l, timestamp: maxTimestamp + 1 } : l));
+               setShapes(prev => prev.map(s => s.id === contextMenu.id ? { ...s, timestamp: maxTimestamp + 1 } : s));
+               setTexts(prev => prev.map(t => t.id === contextMenu.id ? { ...t, timestamp: maxTimestamp + 1 } : t));
+               setImages(prev => prev.map(i => i.id === contextMenu.id ? { ...i, timestamp: maxTimestamp + 1 } : i));
+               setShouldSaveHistory(true);
+               setContextMenu(null);
+            }} 
+            className="w-full text-left px-4 py-2 hover:bg-gray-100 text-sm text-gray-700"
+          >
+            Bring to Front
+          </button>
+          <button 
+            onClick={() => {
+               const minTimestamp = Math.min(
+                  ...lines.map(l => l.timestamp),
+                  ...shapes.map(s => s.timestamp),
+                  ...texts.map(t => t.timestamp),
+                  ...images.map(i => i.timestamp),
+                  Date.now()
+               );
+               setLines(prev => prev.map(l => l.id === contextMenu.id ? { ...l, timestamp: minTimestamp - 1 } : l));
+               setShapes(prev => prev.map(s => s.id === contextMenu.id ? { ...s, timestamp: minTimestamp - 1 } : s));
+               setTexts(prev => prev.map(t => t.id === contextMenu.id ? { ...t, timestamp: minTimestamp - 1 } : t));
+               setImages(prev => prev.map(i => i.id === contextMenu.id ? { ...i, timestamp: minTimestamp - 1 } : i));
+               setShouldSaveHistory(true);
+               setContextMenu(null);
+            }} 
+            className="w-full text-left px-4 py-2 hover:bg-gray-100 text-sm text-gray-700"
+          >
+            Send to Back
+          </button>
+          {images.find(i => i.id === contextMenu.id) && (
+            <button 
+              onClick={() => {
+                 setImages(prev => prev.map(i => i.id === contextMenu.id ? { ...i, isPermanent: true } : i));
+                 setSelectedId(null);
+                 setShouldSaveHistory(true);
+                 setContextMenu(null);
+              }} 
+              className="w-full text-left px-4 py-2 hover:bg-blue-50 text-sm text-blue-600 font-medium border-t border-gray-100"
+            >
+              Make Permanent
+            </button>
+          )}
+          <button 
+            onClick={() => {
+               setLines((prev) => prev.filter((l) => l.id !== contextMenu.id));
+               setShapes((prev) => prev.filter((s) => s.id !== contextMenu.id));
+               setTexts((prev) => prev.filter((t) => t.id !== contextMenu.id));
+               setImages((prev) => prev.filter((i) => i.id !== contextMenu.id));
+               setSelectedId(null);
+               setShouldSaveHistory(true);
+               setContextMenu(null);
+            }} 
+            className="w-full text-left px-4 py-2 hover:bg-red-50 text-sm text-red-600 font-medium border-t border-gray-100"
+          >
+            Delete
+          </button>
+        </div>
+      )}
+
+
 
       {/* Info Button */}
       <div className="absolute bottom-4 right-4 z-10 flex flex-col items-end gap-2">
