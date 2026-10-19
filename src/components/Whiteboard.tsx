@@ -164,10 +164,10 @@ const PARTICIPANT_COLORS = [
 
 function getPersistentUserId(): string {
   try {
-    let uid = localStorage.getItem('wb_user_id');
+    let uid = sessionStorage.getItem('wb_session_user_id');
     if (!uid || !/^[a-zA-Z0-9_-]{1,128}$/.test(uid)) {
       uid = uuidv4();
-      localStorage.setItem('wb_user_id', uid);
+      sessionStorage.setItem('wb_session_user_id', uid);
     }
     return uid;
   } catch {
@@ -286,8 +286,16 @@ export default function Whiteboard() {
   const [historyStep, setHistoryStep] = useState(0);
   const [shouldSaveHistory, setShouldSaveHistory] = useState(false);
 
-  // Text input state
-  const [textInput, setTextInput] = useState<{ x: number; y: number; value: string } | null>(null);
+  // Text input state (supports both creating new text and editing existing text by id)
+  const [textInput, setTextInput] = useState<{
+    id?: string;
+    x: number;
+    y: number;
+    value: string;
+    fontSize?: number;
+    color?: string;
+    _createdAt?: number;
+  } | null>(null);
   const textInputRef = useRef<HTMLTextAreaElement>(null);
 
   // Canvas & static page sizing
@@ -438,7 +446,7 @@ export default function Whiteboard() {
 
       if (throttle) {
         const now = Date.now();
-        if (now - lastEmitTimeRef.current < 85) return;
+        if (now - lastEmitTimeRef.current < 45) return;
         lastEmitTimeRef.current = now;
       }
 
@@ -1349,7 +1357,21 @@ export default function Whiteboard() {
       if (!effectiveCanWrite) return;
 
       if (e.key >= '3' && e.key <= '9') {
-        setPolygonSides(parseInt(e.key));
+        const nextSides = parseInt(e.key);
+        setPolygonSides(nextSides);
+        if (selectedId) {
+          setShapes((prev) =>
+            prev.map((s) => {
+              if (s.id === selectedId && s.type === 'rectangle' && !s.isLocked) {
+                const updated = { ...s, sides: nextSides };
+                sendBoardOp({ type: 'upsert-shape', item: updated });
+                setShouldSaveHistory(true);
+                return updated;
+              }
+              return s;
+            })
+          );
+        }
       }
 
       const key = e.key.toLowerCase();
@@ -1539,7 +1561,24 @@ export default function Whiteboard() {
     if (tool === TOOLS.SELECT || tool === TOOLS.PAN) return;
 
     if (tool === TOOLS.TEXT) {
-      setTextInput({ x: pos.x, y: pos.y, value: '', _createdAt: Date.now() } as any);
+      // If clicking on an existing unlocked text node while in TEXT tool, edit that text instead of creating a duplicate
+      const targetId = e.target?.id?.();
+      const existingText = targetId ? texts.find((t) => t.id === targetId) : undefined;
+      if (existingText && !existingText.isLocked) {
+        setSelectedId(existingText.id);
+        setColor(existingText.color);
+        setTextInput({
+          id: existingText.id,
+          x: existingText.x,
+          y: existingText.y,
+          value: existingText.text,
+          fontSize: existingText.fontSize,
+          color: existingText.color,
+          _createdAt: Date.now(),
+        });
+        return;
+      }
+      setTextInput({ x: pos.x, y: pos.y, value: '', fontSize: 20, color, _createdAt: Date.now() });
       return;
     }
 
@@ -1856,29 +1895,86 @@ export default function Whiteboard() {
     setShouldSaveHistory(true);
   };
 
+  const startEditingText = useCallback(
+    (t: TextData) => {
+      if (!effectiveCanWrite || t.isLocked) return;
+      setSelectedId(t.id);
+      setColor(t.color);
+      setTextInput({
+        id: t.id,
+        x: t.x,
+        y: t.y,
+        value: t.text,
+        fontSize: t.fontSize,
+        color: t.color,
+        _createdAt: Date.now(),
+      });
+    },
+    [effectiveCanWrite]
+  );
+
   const handleTextSubmit = (e?: React.FocusEvent) => {
     if (e && e.type === 'blur') {
-      if (Date.now() - (textInput as any)._createdAt < 120) return;
+      if (Date.now() - (textInput?._createdAt || 0) < 150) return;
     }
     if (!textInput) return;
-    if (textInput.value.trim() && effectiveCanWrite) {
-      const newText: TextData = {
-        id: uuidv4(),
-        x: textInput.x,
-        y: textInput.y,
-        text: textInput.value,
-        color: color,
-        fontSize: 20,
-        timestamp: Date.now(),
-      };
-      setTexts((prev) => [...prev, newText]);
-      sendBoardOp({ type: 'upsert-text', item: newText });
-      setShouldSaveHistory(true);
+
+    if (effectiveCanWrite) {
+      const trimmed = textInput.value.trim();
+      if (textInput.id) {
+        // Updating an existing text element
+        if (trimmed) {
+          setTexts((prev) =>
+            prev.map((t) => {
+              if (t.id === textInput.id) {
+                const updated: TextData = {
+                  ...t,
+                  x: textInput.x,
+                  y: textInput.y,
+                  text: textInput.value,
+                  color: textInput.color || color,
+                  fontSize: textInput.fontSize || t.fontSize || 20,
+                };
+                sendBoardOp({ type: 'upsert-text', item: updated });
+                return updated;
+              }
+              return t;
+            })
+          );
+          setShouldSaveHistory(true);
+        } else {
+          // Empty text on existing element deletes it
+          const idToRemove = textInput.id;
+          setTexts((prev) => prev.filter((t) => t.id !== idToRemove));
+          if (selectedId === idToRemove) setSelectedId(null);
+          sendBoardOp({ type: 'delete-item', id: idToRemove });
+          setShouldSaveHistory(true);
+        }
+      } else if (trimmed) {
+        // Creating a new text element
+        const newText: TextData = {
+          id: uuidv4(),
+          x: textInput.x,
+          y: textInput.y,
+          text: textInput.value,
+          color: textInput.color || color,
+          fontSize: textInput.fontSize || 20,
+          timestamp: Date.now(),
+        };
+        setTexts((prev) => [...prev, newText]);
+        sendBoardOp({ type: 'upsert-text', item: newText });
+        setShouldSaveHistory(true);
+      }
     }
     setTextInput(null);
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      setTextInput(null);
+      return;
+    }
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       handleTextSubmit();
@@ -2345,6 +2441,100 @@ export default function Whiteboard() {
   const selectedLine = lines.find((l) => l.id === selectedId);
   const selectedEntity: any = selectedMedia || selectedShape || selectedText || selectedLine;
 
+  const handleColorSelect = (nextColor: string) => {
+    if (!effectiveCanWrite) return;
+    setColor(nextColor);
+    if (textInput) {
+      setTextInput((prev) => (prev ? { ...prev, color: nextColor } : null));
+    }
+    if (!selectedId) return;
+
+    if (selectedLine && !selectedLine.isLocked && selectedLine.tool !== TOOLS.ERASER) {
+      setLines((prev) =>
+        prev.map((l) => {
+          if (l.id === selectedId) {
+            const updated = { ...l, color: nextColor };
+            sendBoardOp({ type: 'upsert-line', item: updated });
+            return updated;
+          }
+          return l;
+        })
+      );
+      setShouldSaveHistory(true);
+    } else if (selectedShape && !selectedShape.isLocked && selectedShape.type !== 'area_eraser') {
+      setShapes((prev) =>
+        prev.map((s) => {
+          if (s.id === selectedId) {
+            const updated = { ...s, color: nextColor };
+            sendBoardOp({ type: 'upsert-shape', item: updated });
+            return updated;
+          }
+          return s;
+        })
+      );
+      setShouldSaveHistory(true);
+    } else if (selectedText && !selectedText.isLocked) {
+      setTexts((prev) =>
+        prev.map((t) => {
+          if (t.id === selectedId) {
+            const updated = { ...t, color: nextColor };
+            sendBoardOp({ type: 'upsert-text', item: updated });
+            return updated;
+          }
+          return t;
+        })
+      );
+      setShouldSaveHistory(true);
+    }
+  };
+
+  const handleStrokeOrFontSizeChange = (nextVal: number) => {
+    if (!effectiveCanWrite) return;
+    if (selectedText && !selectedText.isLocked) {
+      const nextFontSize = Math.max(10, Math.min(96, nextVal));
+      setTexts((prev) =>
+        prev.map((t) => {
+          if (t.id === selectedId) {
+            const updated = { ...t, fontSize: nextFontSize };
+            sendBoardOp({ type: 'upsert-text', item: updated }, true);
+            return updated;
+          }
+          return t;
+        })
+      );
+      setShouldSaveHistory(true);
+      return;
+    }
+
+    setPenThickness(nextVal);
+
+    if (selectedLine && !selectedLine.isLocked) {
+      setLines((prev) =>
+        prev.map((l) => {
+          if (l.id === selectedId) {
+            const updated = { ...l, strokeWidth: nextVal };
+            sendBoardOp({ type: 'upsert-line', item: updated }, true);
+            return updated;
+          }
+          return l;
+        })
+      );
+      setShouldSaveHistory(true);
+    } else if (selectedShape && !selectedShape.isLocked) {
+      setShapes((prev) =>
+        prev.map((s) => {
+          if (s.id === selectedId) {
+            const updated = { ...s, strokeWidth: nextVal };
+            sendBoardOp({ type: 'upsert-shape', item: updated }, true);
+            return updated;
+          }
+          return s;
+        })
+      );
+      setShouldSaveHistory(true);
+    }
+  };
+
   return (
     <div className="relative w-full h-screen bg-slate-200 overflow-hidden flex flex-col select-none">
       {/* Top Toolbar */}
@@ -2509,18 +2699,22 @@ export default function Whiteboard() {
 
         {/* Color Palette */}
         <div className="flex items-center gap-1.5 px-1.5 border-r border-gray-200">
-          {COLORS.map((c) => (
-            <button
-              key={c}
-              onClick={() => effectiveCanWrite && setColor(c)}
-              disabled={!effectiveCanWrite}
-              className={`w-5 h-5 rounded-full border-2 transition-transform hover:scale-110 disabled:opacity-40 ${
-                color === c ? 'border-gray-400 scale-110' : 'border-transparent'
-              }`}
-              style={{ backgroundColor: c }}
-              title={c}
-            />
-          ))}
+          {COLORS.map((c) => {
+            const activeItemColor =
+              selectedText?.color || selectedShape?.color || selectedLine?.color || color;
+            return (
+              <button
+                key={c}
+                onClick={() => handleColorSelect(c)}
+                disabled={!effectiveCanWrite}
+                className={`w-5 h-5 rounded-full border-2 transition-transform hover:scale-110 disabled:opacity-40 ${
+                  activeItemColor === c ? 'border-gray-400 scale-110' : 'border-transparent'
+                }`}
+                style={{ backgroundColor: c }}
+                title={`Color ${c}`}
+              />
+            );
+          })}
         </div>
 
         {/* Compact Page Expansion Buttons (+100% VH & +100% VW) */}
@@ -2602,19 +2796,40 @@ export default function Whiteboard() {
           </div>
         )}
 
-        {tool === TOOLS.PEN && effectiveCanWrite && (
-          <div className="flex items-center gap-1.5 pl-1.5 border-l border-gray-200">
-            <input
-              type="range"
-              min="1"
-              max="20"
-              value={penThickness}
-              onChange={(e) => setPenThickness(Number(e.target.value))}
-              className="w-20 accent-blue-500"
-              title={`Pen Size: ${penThickness}`}
-            />
-          </div>
-        )}
+        {effectiveCanWrite &&
+          (tool === TOOLS.PEN ||
+            tool === TOOLS.LINE ||
+            tool === TOOLS.RECTANGLE ||
+            tool === TOOLS.CIRCLE ||
+            selectedLine ||
+            selectedShape ||
+            selectedText) && (
+            <div className="flex items-center gap-1.5 pl-1.5 border-l border-gray-200">
+              <input
+                type="range"
+                min={selectedText ? 12 : 1}
+                max={selectedText ? 72 : 20}
+                value={
+                  selectedText
+                    ? Math.round(selectedText.fontSize)
+                    : selectedShape
+                    ? Math.round(selectedShape.strokeWidth)
+                    : selectedLine
+                    ? Math.round(selectedLine.strokeWidth)
+                    : penThickness
+                }
+                onChange={(e) => handleStrokeOrFontSizeChange(Number(e.target.value))}
+                className="w-20 accent-blue-500"
+                title={
+                  selectedText
+                    ? `Text Size: ${Math.round(selectedText.fontSize)}px`
+                    : `Stroke Size: ${
+                        selectedShape?.strokeWidth || selectedLine?.strokeWidth || penThickness
+                      }px`
+                }
+              />
+            </div>
+          )}
       </div>
 
       {/* Collaboration & Permissions Popover */}
@@ -2885,14 +3100,14 @@ export default function Whiteboard() {
       )}
 
       {/* Compact Icon-Only Floating Bar for Selected Element */}
-      {effectiveCanWrite && tool === TOOLS.SELECT && selectedEntity && (
+      {effectiveCanWrite && tool === TOOLS.SELECT && selectedEntity && !textInput && (
         <div
           className="absolute z-30 bg-white shadow-md rounded-lg p-1 border border-gray-200 flex items-center gap-0.5"
           style={{
             left: Math.max(
               12,
               Math.min(
-                stageSize.width - 160,
+                stageSize.width - 180,
                 (selectedEntity.x || 0) * stageScale + stagePos.x
               )
             ),
@@ -2905,6 +3120,16 @@ export default function Whiteboard() {
             ),
           }}
         >
+          {selectedText && !selectedText.isLocked && (
+            <button
+              onClick={() => startEditingText(selectedText)}
+              className="p-1.5 rounded hover:bg-blue-50 text-blue-600"
+              title="Edit Text (Double-Click)"
+            >
+              <Edit3 size={14} />
+            </button>
+          )}
+
           {selectedMedia?.mediaType === 'video' && (
             <>
               <button
@@ -3164,8 +3389,11 @@ export default function Whiteboard() {
               .map((el) => {
                 const canSelect = effectiveCanWrite && tool === TOOLS.SELECT;
                 const canListen =
-                  effectiveCanWrite && (tool === TOOLS.SELECT || tool === TOOLS.ERASER);
-                const canDrag = canSelect && !el.item.isLocked && selectedId === el.item.id;
+                  effectiveCanWrite &&
+                  (tool === TOOLS.SELECT ||
+                    tool === TOOLS.ERASER ||
+                    (el.type === 'textItem' && tool === TOOLS.TEXT));
+                const canDrag = canSelect && !el.item.isLocked;
 
                 if (el.type === 'lineItem') {
                   return (
@@ -3177,7 +3405,7 @@ export default function Whiteboard() {
                       points={el.item.points}
                       stroke={el.item.color}
                       strokeWidth={el.item.strokeWidth}
-                      hitStrokeWidth={Math.max(16, el.item.strokeWidth)}
+                      hitStrokeWidth={Math.max(20, el.item.strokeWidth)}
                       tension={0.5}
                       lineCap="round"
                       lineJoin="round"
@@ -3187,7 +3415,13 @@ export default function Whiteboard() {
                       }
                       listening={el.item.tool === 'eraser' ? false : canListen}
                       draggable={canDrag}
-                      dragDistance={5}
+                      dragDistance={3}
+                      onMouseDown={(e) => {
+                        if (canSelect) {
+                          e.cancelBubble = true;
+                          setSelectedId(el.item.id);
+                        }
+                      }}
                       onClick={(e) => {
                         if (canSelect) {
                           e.cancelBubble = true;
@@ -3202,6 +3436,7 @@ export default function Whiteboard() {
                       }}
                       onDragStart={(e) => {
                         e.cancelBubble = true;
+                        if (canSelect) setSelectedId(el.item.id);
                       }}
                       onDragEnd={(e) => handleDragEnd(e, el.item.id, 'line')}
                       onTransformEnd={(e) => handleTransformEnd(e, el.item.id, 'line')}
@@ -3219,12 +3454,18 @@ export default function Whiteboard() {
                         points={el.item.points || []}
                         stroke={el.item.color}
                         strokeWidth={el.item.strokeWidth}
-                        hitStrokeWidth={Math.max(16, el.item.strokeWidth)}
+                        hitStrokeWidth={Math.max(20, el.item.strokeWidth)}
                         lineCap="round"
                         lineJoin="round"
                         listening={canListen}
                         draggable={canDrag}
-                        dragDistance={5}
+                        dragDistance={3}
+                        onMouseDown={(e) => {
+                          if (canSelect) {
+                            e.cancelBubble = true;
+                            setSelectedId(el.item.id);
+                          }
+                        }}
                         onClick={(e) => {
                           if (canSelect) {
                             e.cancelBubble = true;
@@ -3239,6 +3480,7 @@ export default function Whiteboard() {
                         }}
                         onDragStart={(e) => {
                           e.cancelBubble = true;
+                          if (canSelect) setSelectedId(el.item.id);
                         }}
                         onDragEnd={(e) => handleDragEnd(e, el.item.id, 'shape')}
                         onTransformEnd={(e) => handleTransformEnd(e, el.item.id, 'shape')}
@@ -3252,12 +3494,19 @@ export default function Whiteboard() {
                         x={el.item.x}
                         y={el.item.y}
                         radius={(el.item.width || 0) / 2}
+                        fill="rgba(0,0,0,0.001)"
                         stroke={el.item.color}
                         strokeWidth={el.item.strokeWidth}
-                        hitStrokeWidth={16}
+                        hitStrokeWidth={20}
                         listening={canListen}
                         draggable={canDrag}
-                        dragDistance={5}
+                        dragDistance={3}
+                        onMouseDown={(e) => {
+                          if (canSelect) {
+                            e.cancelBubble = true;
+                            setSelectedId(el.item.id);
+                          }
+                        }}
                         onClick={(e) => {
                           if (canSelect) {
                             e.cancelBubble = true;
@@ -3272,6 +3521,7 @@ export default function Whiteboard() {
                         }}
                         onDragStart={(e) => {
                           e.cancelBubble = true;
+                          if (canSelect) setSelectedId(el.item.id);
                         }}
                         onDragEnd={(e) => handleDragEnd(e, el.item.id, 'shape')}
                         onTransformEnd={(e) => handleTransformEnd(e, el.item.id, 'shape')}
@@ -3286,12 +3536,19 @@ export default function Whiteboard() {
                         y={el.item.y}
                         radiusX={(el.item.width || 0) / 2}
                         radiusY={(el.item.height || 0) / 2}
+                        fill="rgba(0,0,0,0.001)"
                         stroke={el.item.color}
                         strokeWidth={el.item.strokeWidth}
-                        hitStrokeWidth={16}
+                        hitStrokeWidth={20}
                         listening={canListen}
                         draggable={canDrag}
-                        dragDistance={5}
+                        dragDistance={3}
+                        onMouseDown={(e) => {
+                          if (canSelect) {
+                            e.cancelBubble = true;
+                            setSelectedId(el.item.id);
+                          }
+                        }}
                         onClick={(e) => {
                           if (canSelect) {
                             e.cancelBubble = true;
@@ -3306,6 +3563,7 @@ export default function Whiteboard() {
                         }}
                         onDragStart={(e) => {
                           e.cancelBubble = true;
+                          if (canSelect) setSelectedId(el.item.id);
                         }}
                         onDragEnd={(e) => handleDragEnd(e, el.item.id, 'shape')}
                         onTransformEnd={(e) => handleTransformEnd(e, el.item.id, 'shape')}
@@ -3335,12 +3593,19 @@ export default function Whiteboard() {
                           y={el.item.y}
                           points={getPolygonPoints(sides, el.item.width || 0, el.item.height || 0)}
                           closed={true}
+                          fill="rgba(0,0,0,0.001)"
                           stroke={el.item.color}
                           strokeWidth={el.item.strokeWidth}
-                          hitStrokeWidth={16}
+                          hitStrokeWidth={20}
                           listening={canListen}
                           draggable={canDrag}
-                          dragDistance={5}
+                          dragDistance={3}
+                          onMouseDown={(e) => {
+                            if (canSelect) {
+                              e.cancelBubble = true;
+                              setSelectedId(el.item.id);
+                            }
+                          }}
                           onClick={(e) => {
                             if (canSelect) {
                               e.cancelBubble = true;
@@ -3355,6 +3620,7 @@ export default function Whiteboard() {
                           }}
                           onDragStart={(e) => {
                             e.cancelBubble = true;
+                            if (canSelect) setSelectedId(el.item.id);
                           }}
                           onDragEnd={(e) => handleDragEnd(e, el.item.id, 'shape')}
                           onTransformEnd={(e) => handleTransformEnd(e, el.item.id, 'shape')}
@@ -3370,12 +3636,19 @@ export default function Whiteboard() {
                         y={el.item.y}
                         width={el.item.width || 0}
                         height={el.item.height || 0}
+                        fill="rgba(0,0,0,0.001)"
                         stroke={el.item.color}
                         strokeWidth={el.item.strokeWidth}
-                        hitStrokeWidth={16}
+                        hitStrokeWidth={20}
                         listening={canListen}
                         draggable={canDrag}
-                        dragDistance={5}
+                        dragDistance={3}
+                        onMouseDown={(e) => {
+                          if (canSelect) {
+                            e.cancelBubble = true;
+                            setSelectedId(el.item.id);
+                          }
+                        }}
                         onClick={(e) => {
                           if (canSelect) {
                             e.cancelBubble = true;
@@ -3390,6 +3663,7 @@ export default function Whiteboard() {
                         }}
                         onDragStart={(e) => {
                           e.cancelBubble = true;
+                          if (canSelect) setSelectedId(el.item.id);
                         }}
                         onDragEnd={(e) => handleDragEnd(e, el.item.id, 'shape')}
                         onTransformEnd={(e) => handleTransformEnd(e, el.item.id, 'shape')}
@@ -3420,23 +3694,49 @@ export default function Whiteboard() {
                       fontSize={el.item.fontSize}
                       fill={el.item.color}
                       fontFamily="Plus Jakarta Sans, sans-serif"
+                      visible={textInput?.id !== el.item.id}
                       listening={canListen}
                       draggable={canDrag}
-                      dragDistance={5}
+                      dragDistance={3}
+                      onMouseDown={(e) => {
+                        if (canSelect) {
+                          e.cancelBubble = true;
+                          setSelectedId(el.item.id);
+                        }
+                      }}
                       onClick={(e) => {
                         if (canSelect) {
                           e.cancelBubble = true;
                           setSelectedId(el.item.id);
+                        } else if (effectiveCanWrite && tool === TOOLS.TEXT && !el.item.isLocked) {
+                          e.cancelBubble = true;
+                          startEditingText(el.item);
                         }
                       }}
                       onTap={(e) => {
                         if (canSelect) {
                           e.cancelBubble = true;
                           setSelectedId(el.item.id);
+                        } else if (effectiveCanWrite && tool === TOOLS.TEXT && !el.item.isLocked) {
+                          e.cancelBubble = true;
+                          startEditingText(el.item);
+                        }
+                      }}
+                      onDblClick={(e) => {
+                        if (effectiveCanWrite && !el.item.isLocked) {
+                          e.cancelBubble = true;
+                          startEditingText(el.item);
+                        }
+                      }}
+                      onDblTap={(e) => {
+                        if (effectiveCanWrite && !el.item.isLocked) {
+                          e.cancelBubble = true;
+                          startEditingText(el.item);
                         }
                       }}
                       onDragStart={(e) => {
                         e.cancelBubble = true;
+                        if (canSelect) setSelectedId(el.item.id);
                       }}
                       onDragEnd={(e) => handleDragEnd(e, el.item.id, 'text')}
                       onTransformEnd={(e) => handleTransformEnd(e, el.item.id, 'text')}
@@ -3445,6 +3745,90 @@ export default function Whiteboard() {
                 }
                 return null;
               })}
+
+            {/* Draggable Endpoint Handles for Selected Straight Line */}
+            {effectiveCanWrite &&
+              tool === TOOLS.SELECT &&
+              selectedShape &&
+              selectedShape.type === 'line' &&
+              !selectedShape.isLocked &&
+              selectedShape.points &&
+              selectedShape.points.length >= 4 && (
+                <>
+                  {[0, 1].map((endpointIdx) => {
+                    const px = (selectedShape.x || 0) + selectedShape.points![endpointIdx * 2];
+                    const py = (selectedShape.y || 0) + selectedShape.points![endpointIdx * 2 + 1];
+                    return (
+                      <KonvaCircle
+                        key={`line-handle-${selectedShape.id}-${endpointIdx}`}
+                        x={px}
+                        y={py}
+                        radius={6}
+                        fill="#ffffff"
+                        stroke="#2563EB"
+                        strokeWidth={2}
+                        draggable
+                        onMouseDown={(e) => {
+                          e.cancelBubble = true;
+                        }}
+                        onDragStart={(e) => {
+                          e.cancelBubble = true;
+                        }}
+                        onDragMove={(e) => {
+                          e.cancelBubble = true;
+                          const newAbsX = e.target.x();
+                          const newAbsY = e.target.y();
+                          setShapes((prev) =>
+                            prev.map((s) => {
+                              if (s.id !== selectedShape.id || !s.points) return s;
+                              const nextPts = [...s.points];
+                              nextPts[endpointIdx * 2] = newAbsX - (s.x || 0);
+                              nextPts[endpointIdx * 2 + 1] = newAbsY - (s.y || 0);
+                              const updated = { ...s, points: nextPts };
+                              sendBoardOp({ type: 'upsert-shape', item: updated }, true);
+                              return updated;
+                            })
+                          );
+                        }}
+                        onDragEnd={(e) => {
+                          e.cancelBubble = true;
+                          const newAbsX = e.target.x();
+                          const newAbsY = e.target.y();
+                          setShapes((prev) =>
+                            prev.map((s) => {
+                              if (s.id !== selectedShape.id || !s.points) return s;
+                              const absPts = [
+                                (s.x || 0) + s.points[0],
+                                (s.y || 0) + s.points[1],
+                                (s.x || 0) + s.points[2],
+                                (s.y || 0) + s.points[3],
+                              ];
+                              absPts[endpointIdx * 2] = newAbsX;
+                              absPts[endpointIdx * 2 + 1] = newAbsY;
+                              const minX = Math.min(absPts[0], absPts[2]);
+                              const minY = Math.min(absPts[1], absPts[3]);
+                              const updated: ShapeData = {
+                                ...s,
+                                x: minX,
+                                y: minY,
+                                points: [
+                                  absPts[0] - minX,
+                                  absPts[1] - minY,
+                                  absPts[2] - minX,
+                                  absPts[3] - minY,
+                                ],
+                              };
+                              sendBoardOp({ type: 'upsert-shape', item: updated });
+                              return updated;
+                            })
+                          );
+                          setShouldSaveHistory(true);
+                        }}
+                      />
+                    );
+                  })}
+                </>
+              )}
 
             {pointers.map((p) => (
               <Arrow
@@ -3525,8 +3909,8 @@ export default function Whiteboard() {
               position: 'absolute',
               left: `${textInput.x * stageScale + stagePos.x}px`,
               top: `${textInput.y * stageScale + stagePos.y}px`,
-              color: color,
-              fontSize: `${20 * stageScale}px`,
+              color: textInput.color || color,
+              fontSize: `${(textInput.fontSize || 20) * stageScale}px`,
               lineHeight: 1.2,
               fontFamily: 'Plus Jakarta Sans, sans-serif',
             }}
@@ -3543,6 +3927,18 @@ export default function Whiteboard() {
           style={{ left: contextMenu.x, top: contextMenu.y }}
           onClick={(e) => e.stopPropagation()}
         >
+          {texts.find((t) => t.id === contextMenu.id && !t.isLocked) && (
+            <button
+              className="w-full text-left px-4 py-2 text-sm text-gray-700 hover:bg-gray-100 flex items-center gap-2"
+              onClick={() => {
+                const targetText = texts.find((t) => t.id === contextMenu.id);
+                if (targetText) startEditingText(targetText);
+                setContextMenu(null);
+              }}
+            >
+              <Edit3 size={15} /> Edit Text
+            </button>
+          )}
           <button
             className="w-full text-left px-4 py-2 text-sm text-gray-700 hover:bg-gray-100 flex items-center gap-2"
             onClick={() => {

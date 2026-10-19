@@ -116,7 +116,7 @@ service cloud.firestore {
 
       match /participants/{participantId} {
         allow get: if isValidRoomCode(roomCode) && isValidId(participantId);
-        allow list: if isValidRoomCode(roomCode) && existing().userId is string && existing().userId.size() <= 128;
+        allow list: if isValidRoomCode(roomCode);
 
         allow create: if isValidRoomCode(roomCode)
           && isValidId(participantId)
@@ -129,17 +129,14 @@ service cloud.firestore {
           && isValidParticipant(incoming())
           && incoming().userId == existing().userId
           && incoming().isHost == existing().isHost
-          && (
-            // Action: Cursor or heartbeat update by participant
-            incoming().diff(existing()).affectedKeys().hasOnly(['name', 'color', 'cursorX', 'cursorY', 'cursorActive', 'lastSeen'])
-            // Action: Host toggling write permission or kicking participant
-            || incoming().diff(existing()).affectedKeys().hasOnly(['canWrite', 'kicked', 'lastSeen'])
-          );
+          && incoming().diff(existing()).affectedKeys().hasOnly([
+            'name', 'color', 'canWrite', 'kicked', 'cursorX', 'cursorY', 'cursorActive', 'lastSeen'
+          ]);
       }
 
       match /elements/{elementId} {
         allow get: if isValidRoomCode(roomCode) && isValidId(elementId);
-        allow list: if isValidRoomCode(roomCode) && existing().id is string && existing().id.size() <= 128;
+        allow list: if isValidRoomCode(roomCode);
 
         allow create: if isValidRoomCode(roomCode)
           && isValidId(elementId)
