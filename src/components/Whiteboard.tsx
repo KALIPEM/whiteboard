@@ -17,6 +17,17 @@ import * as pdfjsLib from 'pdfjs-dist';
 // @ts-ignore
 import pdfWorker from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorker;
+import {
+  doc,
+  collection,
+  getDoc,
+  getDocs,
+  setDoc,
+  updateDoc,
+  deleteDoc,
+  onSnapshot,
+} from 'firebase/firestore';
+import { db, OperationType, handleFirestoreError } from '../firebase';
 import { TOOLS, ToolType, COLORS } from '../constants';
 import {
   Hand,
@@ -140,10 +151,21 @@ interface HistoryState {
   images: MediaData[];
 }
 
+const PARTICIPANT_COLORS = [
+  '#2563EB',
+  '#D97706',
+  '#059669',
+  '#7C3AED',
+  '#DC2626',
+  '#0891B2',
+  '#4F46E5',
+  '#EA580C',
+];
+
 function getPersistentUserId(): string {
   try {
     let uid = localStorage.getItem('wb_user_id');
-    if (!uid) {
+    if (!uid || !/^[a-zA-Z0-9_-]{1,128}$/.test(uid)) {
       uid = uuidv4();
       localStorage.setItem('wb_user_id', uid);
     }
@@ -153,40 +175,35 @@ function getPersistentUserId(): string {
   }
 }
 
-function getSavedHostToken(roomCode: string): string | undefined {
-  try {
-    const raw = localStorage.getItem('wb_host_tokens');
-    if (!raw) return undefined;
-    const map = JSON.parse(raw);
-    return map[roomCode.toUpperCase()];
-  } catch {
-    return undefined;
+function getParticipantColor(uid: string): string {
+  let hash = 0;
+  for (let i = 0; i < uid.length; i++) {
+    hash = (hash * 31 + uid.charCodeAt(i)) >>> 0;
   }
+  return PARTICIPANT_COLORS[hash % PARTICIPANT_COLORS.length];
 }
 
-function saveHostToken(roomCode: string, token: string) {
-  try {
-    const raw = localStorage.getItem('wb_host_tokens');
-    const map = raw ? JSON.parse(raw) : {};
-    map[roomCode.toUpperCase()] = token;
-    localStorage.setItem('wb_host_tokens', JSON.stringify(map));
-  } catch {
-    // ignore storage errors
+function generateRoomCode(): string {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let code = '';
+  for (let i = 0; i < 6; i++) {
+    code += chars[Math.floor(Math.random() * chars.length)];
   }
+  return code;
 }
 
 function imageToDataUrl(img: HTMLImageElement): string {
   try {
-    if (img.src.startsWith('data:')) return img.src;
+    if (img.src.startsWith('data:') && img.src.length < 800000) return img.src;
     const canvas = document.createElement('canvas');
-    const maxDim = 1200;
+    const maxDim = 1000;
     const scale = Math.min(1, maxDim / Math.max(img.width || 1, img.height || 1));
     canvas.width = Math.max(1, Math.round(img.width * scale));
     canvas.height = Math.max(1, Math.round(img.height * scale));
     const ctx = canvas.getContext('2d');
     if (!ctx) return '';
     ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-    return canvas.toDataURL('image/jpeg', 0.82);
+    return canvas.toDataURL('image/jpeg', 0.78);
   } catch {
     return '';
   }
@@ -214,8 +231,9 @@ export default function Whiteboard() {
   const [pageCols, setPageCols] = useState<number>(1);
   const [pageRows, setPageRows] = useState<number>(1);
 
-  // Real-time Collaboration & Permissions state
+  // Real-time Collaboration & Permissions state (Firebase Firestore)
   const [userId] = useState<string>(() => getPersistentUserId());
+  const [myColor] = useState<string>(() => getParticipantColor(getPersistentUserId()));
   const [displayName, setDisplayName] = useState<string>(() => {
     try {
       return localStorage.getItem('wb_display_name') || '';
@@ -224,6 +242,7 @@ export default function Whiteboard() {
     }
   });
   const [roomCode, setRoomCode] = useState<string | null>(null);
+  const [isConnectingRoom, setIsConnectingRoom] = useState<boolean>(false);
   const [joinCodeInput, setJoinCodeInput] = useState<string>('');
   const [pendingUrlRoom, setPendingUrlRoom] = useState<string | null>(null);
   const [isHost, setIsHost] = useState<boolean>(false);
@@ -237,10 +256,20 @@ export default function Whiteboard() {
   const [copiedType, setCopiedType] = useState<'link' | 'code' | null>(null);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
 
-  const wsRef = useRef<WebSocket | null>(null);
+  const unsubscribesRef = useRef<Array<() => void>>([]);
+  const roomCodeRef = useRef<string | null>(null);
   const lastEmitTimeRef = useRef<number>(0);
   const lastCursorEmitRef = useRef<number>(0);
+  const lastClearedAtRef = useRef<number>(0);
+  const lastPingIdRef = useRef<string>('');
+  const prevCanWriteRef = useRef<boolean | null>(null);
+  const prevGlobalLockRef = useRef<boolean | null>(null);
+  const activeDrawingIdRef = useRef<string | null>(null);
   const toastTimerRef = useRef<any>(null);
+
+  useEffect(() => {
+    roomCodeRef.current = roomCode;
+  }, [roomCode]);
 
   // Effective write permission: true when offline/local, or when Host, or when Guest has canWrite and global guest lock is off
   const effectiveCanWrite = !roomCode || isHost || (canWrite && !allGuestsLocked);
@@ -318,6 +347,7 @@ export default function Whiteboard() {
   useEffect(() => {
     if (!effectiveCanWrite) {
       isDrawing.current = false;
+      activeDrawingIdRef.current = null;
       setSelectedId(null);
       setTextInput(null);
       setCurrentLasso([]);
@@ -330,9 +360,9 @@ export default function Whiteboard() {
 
   // Serialize media item for network sync
   const serializeMediaItem = useCallback((m: MediaData): SerializedMediaData | null => {
-    if (m.mediaType === 'video') return null; // Videos stay local or require external stream
+    if (m.mediaType === 'video') return null; // Videos stay local
     const src = m.src || (m.element instanceof HTMLImageElement ? imageToDataUrl(m.element) : '');
-    if (!src) return null;
+    if (!src || src.length > 850000) return null;
     return {
       id: m.id,
       mediaType: m.mediaType,
@@ -378,371 +408,612 @@ export default function Whiteboard() {
     };
   }, []);
 
-  // Apply incoming remote board delta
-  const applyRemoteOp = useCallback(
-    (op: any) => {
-      if (!op) return;
-      switch (op.type) {
-        case 'upsert-line': {
-          const item = op.item as LineData;
-          if (!item?.id) return;
-          setLines((prev) => {
-            const idx = prev.findIndex((l) => l.id === item.id);
-            if (idx >= 0) {
-              const next = [...prev];
-              next[idx] = item;
-              return next;
+  // Write or delete board operations directly in Firestore
+  const writeElementToFirestore = useCallback(
+    async (activeRoom: string, kind: 'line' | 'shape' | 'text' | 'media', item: any) => {
+      if (!item?.id || !/^[a-zA-Z0-9_-]{1,128}$/.test(item.id)) return;
+      const payload = JSON.stringify(item);
+      if (payload.length < 2 || payload.length > 900000) return;
+      const path = `rooms/${activeRoom}/elements/${item.id}`;
+      try {
+        await setDoc(doc(db, 'rooms', activeRoom, 'elements', item.id), {
+          id: item.id,
+          kind,
+          payload,
+          updatedBy: userId,
+          updatedAt: Date.now(),
+        });
+      } catch (err) {
+        handleFirestoreError(err, OperationType.WRITE, path);
+      }
+    },
+    [userId]
+  );
+
+  // Send a board delta operation to Firestore if in a live room and permitted
+  const sendBoardOp = useCallback(
+    (op: any, throttle = false) => {
+      const activeRoom = roomCodeRef.current;
+      if (!activeRoom || !effectiveCanWrite || !op) return;
+
+      if (throttle) {
+        const now = Date.now();
+        if (now - lastEmitTimeRef.current < 85) return;
+        lastEmitTimeRef.current = now;
+      }
+
+      if (op.type === 'upsert-line' && op.item) {
+        void writeElementToFirestore(activeRoom, 'line', op.item);
+      } else if (op.type === 'upsert-shape' && op.item) {
+        void writeElementToFirestore(activeRoom, 'shape', op.item);
+      } else if (op.type === 'upsert-text' && op.item) {
+        void writeElementToFirestore(activeRoom, 'text', op.item);
+      } else if (op.type === 'upsert-media' && op.item) {
+        void writeElementToFirestore(activeRoom, 'media', op.item);
+      } else if (op.type === 'delete-item' && op.id) {
+        const path = `rooms/${activeRoom}/elements/${op.id}`;
+        deleteDoc(doc(db, 'rooms', activeRoom, 'elements', op.id)).catch((err) =>
+          handleFirestoreError(err, OperationType.DELETE, path)
+        );
+      } else if (op.type === 'clear-board') {
+        const roomPath = `rooms/${activeRoom}`;
+        const clearedTs = Date.now();
+        lastClearedAtRef.current = clearedTs;
+        updateDoc(doc(db, 'rooms', activeRoom), {
+          clearedAt: clearedTs,
+          updatedAt: clearedTs,
+        }).catch((err) => handleFirestoreError(err, OperationType.UPDATE, roomPath));
+
+        getDocs(collection(db, 'rooms', activeRoom, 'elements'))
+          .then((snap) => {
+            snap.docs.forEach((d) => {
+              deleteDoc(d.ref).catch(() => {});
+            });
+          })
+          .catch(() => {});
+      } else if (op.type === 'page-resize') {
+        const roomPath = `rooms/${activeRoom}`;
+        const safeCols = Math.min(20, Math.max(1, Number(op.pageCols) || 1));
+        const safeRows = Math.min(20, Math.max(1, Number(op.pageRows) || 1));
+        updateDoc(doc(db, 'rooms', activeRoom), {
+          pageCols: safeCols,
+          pageRows: safeRows,
+          updatedAt: Date.now(),
+        }).catch((err) => handleFirestoreError(err, OperationType.UPDATE, roomPath));
+      }
+    },
+    [effectiveCanWrite, writeElementToFirestore]
+  );
+
+  const cleanupListeners = useCallback(() => {
+    unsubscribesRef.current.forEach((unsub) => {
+      try {
+        unsub();
+      } catch {
+        // ignore
+      }
+    });
+    unsubscribesRef.current = [];
+  }, []);
+
+  const leaveSession = useCallback(
+    (showNotice = true) => {
+      const activeRoom = roomCodeRef.current;
+      cleanupListeners();
+
+      if (activeRoom) {
+        updateDoc(doc(db, 'rooms', activeRoom, 'participants', userId), {
+          cursorActive: false,
+          lastSeen: Date.now(),
+        }).catch(() => {});
+      }
+
+      roomCodeRef.current = null;
+      setRoomCode(null);
+      setIsHost(false);
+      setCanWrite(true);
+      setAllGuestsLocked(false);
+      setParticipants([]);
+      setRemoteCursors({});
+      setShowCollabPanel(false);
+      prevCanWriteRef.current = null;
+      prevGlobalLockRef.current = null;
+
+      const nextUrl = new URL(window.location.href);
+      nextUrl.searchParams.delete('room');
+      window.history.replaceState({}, '', nextUrl.toString());
+
+      if (showNotice) {
+        showToast('Left the live session');
+      }
+    },
+    [cleanupListeners, showToast, userId]
+  );
+
+  // Attach Firestore real-time listeners for Room, Participants, and Board Elements
+  const subscribeToRoom = useCallback(
+    (targetCode: string, initialIsHost: boolean) => {
+      cleanupListeners();
+
+      // 1. Listen to Room document metadata (global guest lock, page size, clear timestamp, pings)
+      const roomDocRef = doc(db, 'rooms', targetCode);
+      const unsubRoom = onSnapshot(
+        roomDocRef,
+        (snap) => {
+          if (!snap.exists()) return;
+          const data = snap.data();
+
+          const locked = Boolean(data.allGuestsLocked);
+          if (
+            prevGlobalLockRef.current !== null &&
+            prevGlobalLockRef.current !== locked &&
+            !initialIsHost
+          ) {
+            showToast(
+              locked
+                ? 'Host locked the board for all guests (View-Only)'
+                : 'Host unlocked the board for guests'
+            );
+          }
+          prevGlobalLockRef.current = locked;
+          setAllGuestsLocked(locked);
+
+          if (typeof data.pageCols === 'number') setPageCols(Math.max(1, data.pageCols));
+          if (typeof data.pageRows === 'number') setPageRows(Math.max(1, data.pageRows));
+
+          if (typeof data.clearedAt === 'number' && data.clearedAt > lastClearedAtRef.current) {
+            lastClearedAtRef.current = data.clearedAt;
+            setLines([]);
+            setShapes([]);
+            setTexts([]);
+            setImages([]);
+            setSelectedId(null);
+          }
+
+          if (data.pingId && data.pingId !== lastPingIdRef.current) {
+            lastPingIdRef.current = data.pingId;
+            setPointers((prev) => [
+              ...prev.filter((p) => p.id !== data.pingId),
+              {
+                id: data.pingId,
+                x: Number(data.pingX) || 0,
+                y: Number(data.pingY) || 0,
+                color: data.pingColor || '#000000',
+              },
+            ]);
+          }
+        },
+        (err) => handleFirestoreError(err, OperationType.GET, `rooms/${targetCode}`)
+      );
+
+      // 2. Listen to Participants subcollection (permissions, kicks, active user list, live cursors)
+      const partsColRef = collection(db, 'rooms', targetCode, 'participants');
+      const unsubParts = onSnapshot(
+        partsColRef,
+        (snap) => {
+          const allDocs = snap.docs.map((d) => d.data());
+          const myDoc = allDocs.find((p) => p.userId === userId);
+
+          if (myDoc?.kicked) {
+            showToast('You were removed from the session by the host.');
+            leaveSession(false);
+            return;
+          }
+
+          if (myDoc) {
+            const myCanWrite = Boolean(myDoc.isHost || myDoc.canWrite);
+            if (
+              prevCanWriteRef.current !== null &&
+              prevCanWriteRef.current !== myCanWrite &&
+              !myDoc.isHost
+            ) {
+              showToast(
+                myCanWrite
+                  ? 'Host granted you permission to write on the board'
+                  : 'Host switched your access to View-Only'
+              );
             }
-            return [...prev, item];
-          });
-          break;
-        }
-        case 'upsert-shape': {
-          const item = op.item as ShapeData;
-          if (!item?.id) return;
-          setShapes((prev) => {
-            const idx = prev.findIndex((s) => s.id === item.id);
-            if (idx >= 0) {
-              const next = [...prev];
-              next[idx] = item;
-              return next;
+            prevCanWriteRef.current = myCanWrite;
+            setCanWrite(myCanWrite);
+            setIsHost(Boolean(myDoc.isHost));
+          }
+
+          // Filter out kicked participants
+          const activeList = allDocs.filter((p) => !p.kicked);
+
+          setAllGuestsLocked((currentGlobalLock) => {
+            const formatted: ParticipantInfo[] = activeList
+              .map((p) => ({
+                userId: p.userId,
+                name: p.name || 'Guest',
+                color: p.color || '#2563EB',
+                isHost: Boolean(p.isHost),
+                canWrite: Boolean(p.canWrite),
+                effectiveCanWrite: Boolean(p.isHost || (p.canWrite && !currentGlobalLock)),
+                cursor: p.cursorActive ? { x: Number(p.cursorX) || 0, y: Number(p.cursorY) || 0 } : null,
+              }))
+              .sort((a, b) => (a.isHost === b.isHost ? a.name.localeCompare(b.name) : a.isHost ? -1 : 1));
+
+            setParticipants(formatted);
+
+            const nextCursors: Record<string, { name: string; color: string; x: number; y: number }> = {};
+            for (const p of formatted) {
+              if (p.userId !== userId && p.cursor) {
+                nextCursors[p.userId] = {
+                  name: p.name,
+                  color: p.color,
+                  x: p.cursor.x,
+                  y: p.cursor.y,
+                };
+              }
             }
-            return [...prev, item];
+            setRemoteCursors(nextCursors);
+
+            return currentGlobalLock;
           });
-          break;
-        }
-        case 'upsert-text': {
-          const item = op.item as TextData;
-          if (!item?.id) return;
-          setTexts((prev) => {
-            const idx = prev.findIndex((t) => t.id === item.id);
-            if (idx >= 0) {
-              const next = [...prev];
-              next[idx] = item;
-              return next;
+        },
+        (err) => handleFirestoreError(err, OperationType.LIST, `rooms/${targetCode}/participants`)
+      );
+
+      // 3. Listen to Board Elements subcollection (strokes, shapes, text, media)
+      const elementsColRef = collection(db, 'rooms', targetCode, 'elements');
+      const unsubElements = onSnapshot(
+        elementsColRef,
+        (snap) => {
+          snap.docChanges().forEach((change) => {
+            const data = change.doc.data();
+            const elId = data.id || change.doc.id;
+
+            if (change.type === 'removed') {
+              setLines((prev) => prev.filter((l) => l.id !== elId));
+              setShapes((prev) => prev.filter((s) => s.id !== elId));
+              setTexts((prev) => prev.filter((t) => t.id !== elId));
+              setImages((prev) => prev.filter((i) => i.id !== elId));
+              setSelectedId((prev) => (prev === elId ? null : prev));
+              return;
             }
-            return [...prev, item];
+
+            // Avoid overwriting the local user's actively drawn stroke mid-drag
+            if (isDrawing.current && activeDrawingIdRef.current === elId && data.updatedBy === userId) {
+              return;
+            }
+
+            let parsed: any;
+            try {
+              parsed = JSON.parse(data.payload);
+            } catch {
+              return;
+            }
+            if (!parsed || !parsed.id) return;
+
+            if (data.kind === 'line') {
+              setLines((prev) => {
+                const idx = prev.findIndex((l) => l.id === parsed.id);
+                if (idx >= 0) {
+                  const next = [...prev];
+                  next[idx] = parsed;
+                  return next;
+                }
+                return [...prev, parsed];
+              });
+            } else if (data.kind === 'shape') {
+              setShapes((prev) => {
+                const idx = prev.findIndex((s) => s.id === parsed.id);
+                if (idx >= 0) {
+                  const next = [...prev];
+                  next[idx] = parsed;
+                  return next;
+                }
+                return [...prev, parsed];
+              });
+            } else if (data.kind === 'text') {
+              setTexts((prev) => {
+                const idx = prev.findIndex((t) => t.id === parsed.id);
+                if (idx >= 0) {
+                  const next = [...prev];
+                  next[idx] = parsed;
+                  return next;
+                }
+                return [...prev, parsed];
+              });
+            } else if (data.kind === 'media') {
+              hydrateMediaItem(parsed as SerializedMediaData);
+            }
           });
-          break;
-        }
-        case 'upsert-media': {
-          const item = op.item as SerializedMediaData;
-          if (!item?.id) return;
-          hydrateMediaItem(item);
-          break;
-        }
-        case 'delete-item': {
-          const id = op.id;
-          if (!id) return;
-          setLines((prev) => prev.filter((l) => l.id !== id));
-          setShapes((prev) => prev.filter((s) => s.id !== id));
-          setTexts((prev) => prev.filter((t) => t.id !== id));
-          setImages((prev) => prev.filter((i) => i.id !== id));
-          setSelectedId((prev) => (prev === id ? null : prev));
-          break;
-        }
-        case 'clear-board': {
+        },
+        (err) => handleFirestoreError(err, OperationType.LIST, `rooms/${targetCode}/elements`)
+      );
+
+      unsubscribesRef.current = [unsubRoom, unsubParts, unsubElements];
+    },
+    [cleanupListeners, hydrateMediaItem, leaveSession, showToast, userId]
+  );
+
+  // Create or Join a live hosted board session using Firebase Firestore
+  const connectToSession = useCallback(
+    async (mode: 'create' | 'join', targetRoomCode?: string, customName?: string) => {
+      if (isConnectingRoom) return;
+      setIsConnectingRoom(true);
+
+      const rawName = (customName ?? displayName).trim() || (mode === 'create' ? 'Host' : 'Guest');
+      const safeName = rawName.slice(0, 32);
+      try {
+        localStorage.setItem('wb_display_name', safeName);
+      } catch {
+        // ignore
+      }
+      setDisplayName(safeName);
+
+      try {
+        if (mode === 'create') {
+          let newCode = generateRoomCode();
+          const existingCheck = await getDoc(doc(db, 'rooms', newCode));
+          if (existingCheck.exists()) {
+            newCode = generateRoomCode();
+          }
+
+          const now = Date.now();
+          const safeCols = Math.min(20, Math.max(1, pageCols));
+          const safeRows = Math.min(20, Math.max(1, pageRows));
+
+          try {
+            await setDoc(doc(db, 'rooms', newCode), {
+              roomCode: newCode,
+              hostId: userId,
+              allGuestsLocked: false,
+              pageCols: safeCols,
+              pageRows: safeRows,
+              pingId: '',
+              pingX: 0,
+              pingY: 0,
+              pingColor: '#000000',
+              clearedAt: 0,
+              updatedAt: now,
+            });
+          } catch (err) {
+            handleFirestoreError(err, OperationType.CREATE, `rooms/${newCode}`);
+          }
+
+          try {
+            await setDoc(doc(db, 'rooms', newCode, 'participants', userId), {
+              userId,
+              name: safeName,
+              color: myColor,
+              isHost: true,
+              canWrite: true,
+              kicked: false,
+              cursorX: 0,
+              cursorY: 0,
+              cursorActive: false,
+              lastSeen: now,
+            });
+          } catch (err) {
+            handleFirestoreError(err, OperationType.CREATE, `rooms/${newCode}/participants/${userId}`);
+          }
+
+          // Upload current local board elements into the hosted room
+          const uploadPromises: Promise<any>[] = [];
+          for (const l of lines) {
+            uploadPromises.push(writeElementToFirestore(newCode, 'line', l));
+          }
+          for (const s of shapes) {
+            uploadPromises.push(writeElementToFirestore(newCode, 'shape', s));
+          }
+          for (const t of texts) {
+            uploadPromises.push(writeElementToFirestore(newCode, 'text', t));
+          }
+          for (const m of images) {
+            const serialized = serializeMediaItem(m);
+            if (serialized) {
+              uploadPromises.push(writeElementToFirestore(newCode, 'media', serialized));
+            }
+          }
+          await Promise.all(uploadPromises);
+
+          roomCodeRef.current = newCode;
+          setRoomCode(newCode);
+          setIsHost(true);
+          setCanWrite(true);
+          setAllGuestsLocked(false);
+          setPendingUrlRoom(null);
+
+          const nextUrl = new URL(window.location.href);
+          nextUrl.searchParams.set('room', newCode);
+          window.history.replaceState({}, '', nextUrl.toString());
+
+          subscribeToRoom(newCode, true);
+          showToast(`Hosting live room ${newCode}`);
+        } else if (mode === 'join' && targetRoomCode) {
+          const cleanCode = targetRoomCode.trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+          if (cleanCode.length < 4 || cleanCode.length > 8) {
+            showToast('Invalid room code.');
+            setIsConnectingRoom(false);
+            return;
+          }
+
+          let roomSnap;
+          try {
+            roomSnap = await getDoc(doc(db, 'rooms', cleanCode));
+          } catch (err) {
+            handleFirestoreError(err, OperationType.GET, `rooms/${cleanCode}`);
+          }
+
+          if (!roomSnap || !roomSnap.exists()) {
+            showToast(`Room ${cleanCode} not found.`);
+            setPendingUrlRoom(null);
+            setIsConnectingRoom(false);
+            return;
+          }
+
+          const roomData = roomSnap.data();
+          const amIHost = roomData.hostId === userId;
+          const partRef = doc(db, 'rooms', cleanCode, 'participants', userId);
+          let partSnap;
+          try {
+            partSnap = await getDoc(partRef);
+          } catch (err) {
+            handleFirestoreError(err, OperationType.GET, `rooms/${cleanCode}/participants/${userId}`);
+          }
+
+          let initialCanWrite = amIHost;
+
+          if (partSnap && partSnap.exists()) {
+            const existingPart = partSnap.data();
+            if (existingPart.kicked && !amIHost) {
+              showToast('You were removed from this session by the host.');
+              setPendingUrlRoom(null);
+              setIsConnectingRoom(false);
+              return;
+            }
+            initialCanWrite = Boolean(amIHost || existingPart.canWrite);
+            try {
+              await updateDoc(partRef, {
+                name: safeName,
+                color: myColor,
+                cursorX: 0,
+                cursorY: 0,
+                cursorActive: false,
+                lastSeen: Date.now(),
+              });
+            } catch (err) {
+              handleFirestoreError(err, OperationType.UPDATE, `rooms/${cleanCode}/participants/${userId}`);
+            }
+          } else {
+            try {
+              await setDoc(partRef, {
+                userId,
+                name: safeName,
+                color: myColor,
+                isHost: amIHost,
+                canWrite: amIHost, // Guests start in View-Only mode by default
+                kicked: false,
+                cursorX: 0,
+                cursorY: 0,
+                cursorActive: false,
+                lastSeen: Date.now(),
+              });
+            } catch (err) {
+              handleFirestoreError(err, OperationType.CREATE, `rooms/${cleanCode}/participants/${userId}`);
+            }
+          }
+
+          // Clear local board before loading shared room state
           setLines([]);
           setShapes([]);
           setTexts([]);
           setImages([]);
           setSelectedId(null);
-          break;
-        }
-        case 'page-resize': {
-          if (typeof op.pageCols === 'number') setPageCols(Math.max(1, op.pageCols));
-          if (typeof op.pageRows === 'number') setPageRows(Math.max(1, op.pageRows));
-          break;
-        }
-      }
-    },
-    [hydrateMediaItem]
-  );
 
-  // Send a board delta operation over WebSocket if connected and permitted
-  const sendBoardOp = useCallback(
-    (op: any, throttle = false) => {
-      const ws = wsRef.current;
-      if (!ws || ws.readyState !== WebSocket.OPEN || !effectiveCanWrite) return;
-      if (throttle) {
-        const now = Date.now();
-        if (now - lastEmitTimeRef.current < 35) return;
-        lastEmitTimeRef.current = now;
-      }
-      ws.send(JSON.stringify({ type: 'board:op', op }));
-    },
-    [effectiveCanWrite]
-  );
+          lastClearedAtRef.current = Number(roomData.clearedAt) || 0;
+          lastPingIdRef.current = roomData.pingId || '';
+          prevCanWriteRef.current = initialCanWrite;
+          prevGlobalLockRef.current = Boolean(roomData.allGuestsLocked);
 
-  // Connect WebSocket and either create or join a room
-  const connectToSession = useCallback(
-    (mode: 'create' | 'join', targetRoomCode?: string, customName?: string) => {
-      if (wsRef.current) {
-        wsRef.current.close();
-        wsRef.current = null;
-      }
-
-      const nameToUse = (customName ?? displayName).trim() || (mode === 'create' ? 'Host' : 'Guest');
-      try {
-        localStorage.setItem('wb_display_name', nameToUse);
-      } catch {
-        // ignore
-      }
-      setDisplayName(nameToUse);
-
-      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsUrl = `${protocol}//${window.location.host}/ws`;
-      const ws = new WebSocket(wsUrl);
-      wsRef.current = ws;
-
-      ws.onopen = () => {
-        if (mode === 'create') {
-          const serializedMedia = images
-            .map((m) => serializeMediaItem(m))
-            .filter((m): m is SerializedMediaData => m !== null);
-
-          ws.send(
-            JSON.stringify({
-              type: 'room:create',
-              userId,
-              name: nameToUse,
-              boardState: {
-                pageCols,
-                pageRows,
-                lines,
-                shapes,
-                texts,
-                media: serializedMedia,
-              },
-            })
-          );
-        } else if (mode === 'join' && targetRoomCode) {
-          const cleanCode = targetRoomCode.trim().toUpperCase();
-          const savedHostToken = getSavedHostToken(cleanCode);
-          ws.send(
-            JSON.stringify({
-              type: 'room:join',
-              roomCode: cleanCode,
-              userId,
-              name: nameToUse,
-              hostToken: savedHostToken,
-            })
-          );
-        }
-      };
-
-      ws.onmessage = (event) => {
-        let msg: any;
-        try {
-          msg = JSON.parse(event.data);
-        } catch {
-          return;
-        }
-
-        if (msg.type === 'room:init') {
-          setRoomCode(msg.roomCode);
-          setIsHost(Boolean(msg.isHost));
-          setCanWrite(Boolean(msg.canWrite));
-          setAllGuestsLocked(Boolean(msg.allGuestsLocked));
-          setParticipants(Array.isArray(msg.participants) ? msg.participants : []);
+          roomCodeRef.current = cleanCode;
+          setRoomCode(cleanCode);
+          setIsHost(amIHost);
+          setCanWrite(initialCanWrite);
+          setAllGuestsLocked(Boolean(roomData.allGuestsLocked));
           setPendingUrlRoom(null);
 
-          if (msg.hostToken && msg.roomCode) {
-            saveHostToken(msg.roomCode, msg.hostToken);
-          }
-
-          // Update URL query parameter without reloading
           const nextUrl = new URL(window.location.href);
-          nextUrl.searchParams.set('room', msg.roomCode);
+          nextUrl.searchParams.set('room', cleanCode);
           window.history.replaceState({}, '', nextUrl.toString());
 
-          if (msg.boardState) {
-            setPageCols(msg.boardState.pageCols || 1);
-            setPageRows(msg.boardState.pageRows || 1);
-            setLines(Array.isArray(msg.boardState.lines) ? msg.boardState.lines : []);
-            setShapes(Array.isArray(msg.boardState.shapes) ? msg.boardState.shapes : []);
-            setTexts(Array.isArray(msg.boardState.texts) ? msg.boardState.texts : []);
-            setImages([]);
-            if (Array.isArray(msg.boardState.media)) {
-              msg.boardState.media.forEach((m: SerializedMediaData) => hydrateMediaItem(m));
-            }
-          }
-
-          if (msg.isHost) {
-            showToast(`Hosting room ${msg.roomCode}`);
-          } else {
-            showToast(
-              msg.effectiveCanWrite
-                ? `Joined room ${msg.roomCode} (Write enabled)`
-                : `Joined room ${msg.roomCode} (View-Only until host grants access)`
-            );
-          }
-          return;
+          subscribeToRoom(cleanCode, amIHost);
+          showToast(
+            amIHost
+              ? `Rejoined your hosted room ${cleanCode}`
+              : initialCanWrite && !roomData.allGuestsLocked
+              ? `Joined room ${cleanCode} (Write enabled)`
+              : `Joined room ${cleanCode} (View-Only until host grants access)`
+          );
         }
-
-        if (msg.type === 'room:error') {
-          showToast(msg.message || 'Could not join room.');
-          setPendingUrlRoom(null);
-          return;
-        }
-
-        if (msg.type === 'participants:updated') {
-          setAllGuestsLocked(Boolean(msg.allGuestsLocked));
-          const list: ParticipantInfo[] = Array.isArray(msg.participants) ? msg.participants : [];
-          setParticipants(list);
-
-          // Prune cursors of disconnected users
-          const activeIds = new Set(list.map((p) => p.userId));
-          setRemoteCursors((prev) => {
-            const next: typeof prev = {};
-            for (const [k, v] of Object.entries(prev)) {
-              if (activeIds.has(k)) next[k] = v;
-            }
-            return next;
-          });
-
-          if (msg.eventNotice) {
-            showToast(msg.eventNotice);
-          }
-          return;
-        }
-
-        if (msg.type === 'permission:changed') {
-          setCanWrite(Boolean(msg.canWrite));
-          setAllGuestsLocked(Boolean(msg.allGuestsLocked));
-          if (msg.notice) {
-            showToast(msg.notice);
-          }
-          return;
-        }
-
-        if (msg.type === 'permission:denied') {
-          if (msg.message) showToast(msg.message);
-          return;
-        }
-
-        if (msg.type === 'room:kicked') {
-          showToast(msg.message || 'You were removed from the session.');
-          leaveSession(false);
-          return;
-        }
-
-        if (msg.type === 'cursor:updated') {
-          if (!msg.userId || msg.userId === userId) return;
-          if (!msg.cursor) {
-            setRemoteCursors((prev) => {
-              const next = { ...prev };
-              delete next[msg.userId];
-              return next;
-            });
-          } else {
-            setRemoteCursors((prev) => ({
-              ...prev,
-              [msg.userId]: {
-                name: msg.name || 'Guest',
-                color: msg.color || '#2563EB',
-                x: msg.cursor.x,
-                y: msg.cursor.y,
-              },
-            }));
-          }
-          return;
-        }
-
-        if (msg.type === 'board:ping' && msg.pointer) {
-          setPointers((prev) => [...prev.filter((p) => p.id !== msg.pointer.id), msg.pointer]);
-          return;
-        }
-
-        if (msg.type === 'board:op' && msg.op) {
-          applyRemoteOp(msg.op);
-        }
-      };
-
-      ws.onclose = () => {
-        wsRef.current = null;
-      };
+      } finally {
+        setIsConnectingRoom(false);
+      }
     },
-    [displayName, images, lines, shapes, texts, pageCols, pageRows, userId, serializeMediaItem, hydrateMediaItem, applyRemoteOp, showToast]
+    [
+      displayName,
+      images,
+      isConnectingRoom,
+      lines,
+      myColor,
+      pageCols,
+      pageRows,
+      serializeMediaItem,
+      shapes,
+      showToast,
+      subscribeToRoom,
+      texts,
+      userId,
+      writeElementToFirestore,
+    ]
   );
 
-  const leaveSession = useCallback((showNotice = true) => {
-    if (wsRef.current) {
-      wsRef.current.close();
-      wsRef.current = null;
-    }
-    setRoomCode(null);
-    setIsHost(false);
-    setCanWrite(true);
-    setAllGuestsLocked(false);
-    setParticipants([]);
-    setRemoteCursors({});
-    setShowCollabPanel(false);
+  // Re-evaluate participant effectiveCanWrite whenever allGuestsLocked changes
+  useEffect(() => {
+    setParticipants((prev) =>
+      prev.map((p) => ({
+        ...p,
+        effectiveCanWrite: Boolean(p.isHost || (p.canWrite && !allGuestsLocked)),
+      }))
+    );
+  }, [allGuestsLocked]);
 
-    const nextUrl = new URL(window.location.href);
-    nextUrl.searchParams.delete('room');
-    window.history.replaceState({}, '', nextUrl.toString());
-
-    if (showNotice) {
-      showToast('Left the live session');
-    }
-  }, [showToast]);
-
-  // Host moderation helpers
-  const handleToggleUserWrite = (targetUserId: string, nextCanWrite: boolean) => {
-    const ws = wsRef.current;
-    if (!ws || ws.readyState !== WebSocket.OPEN || !isHost) return;
-    ws.send(
-      JSON.stringify({
-        type: 'permission:setUser',
-        targetUserId,
+  // Host moderation helpers (backed by Firestore)
+  const handleToggleUserWrite = async (targetUserId: string, nextCanWrite: boolean) => {
+    if (!roomCode || !isHost) return;
+    const path = `rooms/${roomCode}/participants/${targetUserId}`;
+    try {
+      await updateDoc(doc(db, 'rooms', roomCode, 'participants', targetUserId), {
         canWrite: nextCanWrite,
-      })
-    );
+        lastSeen: Date.now(),
+      });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, path);
+    }
   };
 
-  const handleToggleGlobalLock = (nextLocked: boolean) => {
-    const ws = wsRef.current;
-    if (!ws || ws.readyState !== WebSocket.OPEN || !isHost) return;
-    ws.send(
-      JSON.stringify({
-        type: 'permission:setGlobalLock',
+  const handleToggleGlobalLock = async (nextLocked: boolean) => {
+    if (!roomCode || !isHost) return;
+    const path = `rooms/${roomCode}`;
+    try {
+      await updateDoc(doc(db, 'rooms', roomCode), {
         allGuestsLocked: nextLocked,
-      })
-    );
+        updatedAt: Date.now(),
+      });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, path);
+    }
   };
 
-  const handleKickParticipant = (targetUserId: string) => {
-    const ws = wsRef.current;
-    if (!ws || ws.readyState !== WebSocket.OPEN || !isHost) return;
-    ws.send(
-      JSON.stringify({
-        type: 'participant:kick',
-        targetUserId,
-      })
-    );
+  const handleKickParticipant = async (targetUserId: string) => {
+    if (!roomCode || !isHost) return;
+    const path = `rooms/${roomCode}/participants/${targetUserId}`;
+    try {
+      await updateDoc(doc(db, 'rooms', roomCode, 'participants', targetUserId), {
+        kicked: true,
+        canWrite: false,
+        lastSeen: Date.now(),
+      });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, path);
+    }
   };
 
   // Check URL for `?room=CODE` on initial load
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const urlRoom = params.get('room')?.trim().toUpperCase();
-    if (urlRoom && urlRoom.length >= 4) {
-      const savedToken = getSavedHostToken(urlRoom);
-      if (savedToken) {
-        // Host reconnecting to their own room automatically
-        connectToSession('join', urlRoom, displayName || 'Host');
-      } else {
-        setJoinCodeInput(urlRoom);
-        setPendingUrlRoom(urlRoom);
-      }
+    if (urlRoom && /^[A-Z0-9]{4,8}$/.test(urlRoom)) {
+      setJoinCodeInput(urlRoom);
+      setPendingUrlRoom(urlRoom);
     }
     return () => {
-      if (wsRef.current) {
-        wsRef.current.close();
-      }
+      cleanupListeners();
     };
-  }, []);
+  }, [cleanupListeners]);
 
   useEffect(() => {
     const handleResize = () => {
@@ -866,24 +1137,42 @@ export default function Whiteboard() {
   }, [shouldSaveHistory, lines, shapes, texts, images, history, historyStep]);
 
   const syncFullBoardState = useCallback(
-    (nextLines: LineData[], nextShapes: ShapeData[], nextTexts: TextData[], nextImages: MediaData[]) => {
-      if (!roomCode || !effectiveCanWrite) return;
-      const serializedMedia = nextImages
-        .map((m) => serializeMediaItem(m))
-        .filter((m): m is SerializedMediaData => m !== null);
-      sendBoardOp({
-        type: 'full-sync',
-        boardState: {
-          pageCols,
-          pageRows,
-          lines: nextLines,
-          shapes: nextShapes,
-          texts: nextTexts,
-          media: serializedMedia,
-        },
+    async (
+      nextLines: LineData[],
+      nextShapes: ShapeData[],
+      nextTexts: TextData[],
+      nextImages: MediaData[]
+    ) => {
+      const activeRoom = roomCodeRef.current;
+      if (!activeRoom || !effectiveCanWrite) return;
+
+      const targetIds = new Set<string>([
+        ...nextLines.map((l) => l.id),
+        ...nextShapes.map((s) => s.id),
+        ...nextTexts.map((t) => t.id),
+        ...nextImages.map((i) => i.id),
+      ]);
+
+      try {
+        const existingSnap = await getDocs(collection(db, 'rooms', activeRoom, 'elements'));
+        existingSnap.docs.forEach((d) => {
+          if (!targetIds.has(d.id)) {
+            deleteDoc(d.ref).catch(() => {});
+          }
+        });
+      } catch {
+        // ignore
+      }
+
+      nextLines.forEach((l) => void writeElementToFirestore(activeRoom, 'line', l));
+      nextShapes.forEach((s) => void writeElementToFirestore(activeRoom, 'shape', s));
+      nextTexts.forEach((t) => void writeElementToFirestore(activeRoom, 'text', t));
+      nextImages.forEach((m) => {
+        const serialized = serializeMediaItem(m);
+        if (serialized) void writeElementToFirestore(activeRoom, 'media', serialized);
       });
     },
-    [roomCode, effectiveCanWrite, pageCols, pageRows, serializeMediaItem, sendBoardOp]
+    [effectiveCanWrite, serializeMediaItem, writeElementToFirestore]
   );
 
   const undo = () => {
@@ -901,7 +1190,7 @@ export default function Whiteboard() {
       setImages(nextImages);
       setHistoryStep(prevStep);
       setSelectedId(null);
-      syncFullBoardState(nextLines, nextShapes, nextTexts, nextImages);
+      void syncFullBoardState(nextLines, nextShapes, nextTexts, nextImages);
     }
   };
 
@@ -920,7 +1209,7 @@ export default function Whiteboard() {
       setImages(nextImages);
       setHistoryStep(nextStep);
       setSelectedId(null);
-      syncFullBoardState(nextLines, nextShapes, nextTexts, nextImages);
+      void syncFullBoardState(nextLines, nextShapes, nextTexts, nextImages);
     }
   };
 
@@ -1017,7 +1306,7 @@ export default function Whiteboard() {
 
   const expandVertically = () => {
     if (!effectiveCanWrite) return;
-    const nextRows = pageRows + 1;
+    const nextRows = Math.min(20, pageRows + 1);
     setPageRows(nextRows);
     sendBoardOp({ type: 'page-resize', pageCols, pageRows: nextRows });
     if (!isPageLocked) {
@@ -1035,7 +1324,7 @@ export default function Whiteboard() {
 
   const expandHorizontally = () => {
     if (!effectiveCanWrite) return;
-    const nextCols = pageCols + 1;
+    const nextCols = Math.min(20, pageCols + 1);
     setPageCols(nextCols);
     sendBoardOp({ type: 'page-resize', pageCols: nextCols, pageRows });
     if (!isPageLocked) {
@@ -1168,6 +1457,19 @@ export default function Whiteboard() {
     };
   };
 
+  const broadcastPointerPing = (pointer: { id: string; x: number; y: number; color: string }) => {
+    const activeRoom = roomCodeRef.current;
+    if (!activeRoom) return;
+    lastPingIdRef.current = pointer.id;
+    updateDoc(doc(db, 'rooms', activeRoom), {
+      pingId: pointer.id.slice(0, 128),
+      pingX: pointer.x,
+      pingY: pointer.y,
+      pingColor: (pointer.color || '#000000').slice(0, 32),
+      updatedAt: Date.now(),
+    }).catch((err) => handleFirestoreError(err, OperationType.UPDATE, `rooms/${activeRoom}`));
+  };
+
   const handleContextMenu = (e: any) => {
     e.evt.preventDefault();
     if (!effectiveCanWrite) return;
@@ -1179,9 +1481,7 @@ export default function Whiteboard() {
       if (pos) {
         const pointer = { x: pos.x, y: pos.y, color: 'black', id: uuidv4() };
         setPointers([pointer]);
-        if (wsRef.current?.readyState === WebSocket.OPEN) {
-          wsRef.current.send(JSON.stringify({ type: 'board:ping', pointer }));
-        }
+        broadcastPointerPing(pointer);
       }
       return;
     }
@@ -1217,9 +1517,7 @@ export default function Whiteboard() {
       if (pos) {
         const pointer = { x: pos.x, y: pos.y, color: 'black', id: uuidv4() };
         setPointers([pointer]);
-        if (wsRef.current?.readyState === WebSocket.OPEN) {
-          wsRef.current.send(JSON.stringify({ type: 'board:ping', pointer }));
-        }
+        broadcastPointerPing(pointer);
       }
       return;
     }
@@ -1272,6 +1570,7 @@ export default function Whiteboard() {
     }
 
     const id = uuidv4();
+    activeDrawingIdRef.current = id;
     let strokeWidth = tool === TOOLS.PEN ? penThickness : 2;
     if (tool === TOOLS.MARKER) strokeWidth = 12;
     if (tool === TOOLS.ERASER) strokeWidth = 24;
@@ -1339,12 +1638,18 @@ export default function Whiteboard() {
     const pos = getStagePointerPos(stage);
     if (!pos) return;
 
-    // Broadcast live cursor position to room participants
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+    // Broadcast live cursor position to room participants via Firestore
+    const activeRoom = roomCodeRef.current;
+    if (activeRoom) {
       const now = Date.now();
-      if (now - lastCursorEmitRef.current > 40) {
+      if (now - lastCursorEmitRef.current > 110) {
         lastCursorEmitRef.current = now;
-        wsRef.current.send(JSON.stringify({ type: 'cursor:move', cursor: pos }));
+        updateDoc(doc(db, 'rooms', activeRoom, 'participants', userId), {
+          cursorX: Math.round(pos.x),
+          cursorY: Math.round(pos.y),
+          cursorActive: true,
+          lastSeen: now,
+        }).catch(() => {});
       }
     }
 
@@ -1444,6 +1749,7 @@ export default function Whiteboard() {
   const handleMouseUp = () => {
     if (!isDrawing.current) return;
     isDrawing.current = false;
+    activeDrawingIdRef.current = null;
 
     if (tool === TOOLS.AREA_ERASER && currentLasso.length > 4) {
       const lassoShape: ShapeData = {
@@ -1635,7 +1941,7 @@ export default function Whiteboard() {
 
       for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
         const page = await pdf.getPage(pageNum);
-        const viewport = page.getViewport({ scale: 1.5 });
+        const viewport = page.getViewport({ scale: 1.4 });
         const canvas = document.createElement('canvas');
         const context = canvas.getContext('2d');
         if (!context) continue;
@@ -1647,7 +1953,7 @@ export default function Whiteboard() {
           viewport: viewport,
         } as any).promise;
 
-        const dataUrl = canvas.toDataURL('image/jpeg', 0.85);
+        const dataUrl = canvas.toDataURL('image/jpeg', 0.8);
         const img = new window.Image();
         img.src = dataUrl;
 
@@ -1683,7 +1989,7 @@ export default function Whiteboard() {
 
       if (yOffset + 40 > pageHeight) {
         const neededRows = Math.ceil((yOffset + 40) / baseViewport.height);
-        const nextRows = Math.max(pageRows, neededRows);
+        const nextRows = Math.min(20, Math.max(pageRows, neededRows));
         setPageRows(nextRows);
         sendBoardOp({ type: 'page-resize', pageCols, pageRows: nextRows });
       }
@@ -2343,9 +2649,10 @@ export default function Whiteboard() {
 
               <button
                 onClick={() => connectToSession('create')}
-                className="w-full py-2 px-4 bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold rounded-lg transition-colors whitespace-nowrap"
+                disabled={isConnectingRoom}
+                className="w-full py-2 px-4 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white text-xs font-semibold rounded-lg transition-colors whitespace-nowrap"
               >
-                Host Live Board
+                {isConnectingRoom ? 'Starting Session...' : 'Host Live Board'}
               </button>
 
               <div className="pt-3 border-t border-slate-200">
@@ -2367,7 +2674,7 @@ export default function Whiteboard() {
                         connectToSession('join', joinCodeInput.trim());
                       }
                     }}
-                    disabled={!joinCodeInput.trim()}
+                    disabled={!joinCodeInput.trim() || isConnectingRoom}
                     className="py-2 px-3 bg-slate-900 hover:bg-slate-800 disabled:opacity-40 text-white text-xs font-semibold rounded-lg transition-colors whitespace-nowrap shrink-0"
                   >
                     Join
@@ -2560,9 +2867,10 @@ export default function Whiteboard() {
               </button>
               <button
                 onClick={() => connectToSession('join', pendingUrlRoom, displayName || 'Guest')}
-                className="px-4 py-2 text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white rounded-lg"
+                disabled={isConnectingRoom}
+                className="px-4 py-2 text-xs font-semibold bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white rounded-lg"
               >
-                Join Board
+                {isConnectingRoom ? 'Joining...' : 'Join Board'}
               </button>
             </div>
           </div>
@@ -3215,23 +3523,15 @@ export default function Whiteboard() {
             onKeyDown={handleKeyDown}
             style={{
               position: 'absolute',
-              top: textInput.y * stageScale + stagePos.y,
-              left: textInput.x * stageScale + stagePos.x,
-              fontSize: `${20 * stageScale}px`,
-              fontFamily: 'Plus Jakarta Sans, sans-serif',
+              left: `${textInput.x * stageScale + stagePos.x}px`,
+              top: `${textInput.y * stageScale + stagePos.y}px`,
               color: color,
-              border: '1px dashed #ccc',
-              background: 'transparent',
-              outline: 'none',
-              resize: 'none',
-              overflow: 'hidden',
-              minWidth: '100px',
-              minHeight: '30px',
-              zIndex: 10,
+              fontSize: `${20 * stageScale}px`,
               lineHeight: 1.2,
+              fontFamily: 'Plus Jakarta Sans, sans-serif',
             }}
+            className="bg-white/95 backdrop-blur-sm border-2 border-blue-500 rounded px-2 py-1 shadow-lg outline-none resize min-w-[150px] min-h-[40px] z-30"
             placeholder="Type here..."
-            autoFocus
           />
         )}
       </div>
@@ -3239,125 +3539,95 @@ export default function Whiteboard() {
       {/* Context Menu */}
       {contextMenu && effectiveCanWrite && (
         <div
-          className="absolute bg-white shadow-xl rounded-lg py-1 z-50 border border-gray-200 min-w-[180px]"
+          className="fixed bg-white shadow-xl rounded-lg py-1 z-50 border border-gray-200 min-w-[160px]"
           style={{ left: contextMenu.x, top: contextMenu.y }}
-          onContextMenu={(e) => e.preventDefault()}
+          onClick={(e) => e.stopPropagation()}
         >
           <button
+            className="w-full text-left px-4 py-2 text-sm text-gray-700 hover:bg-gray-100 flex items-center gap-2"
             onClick={() => {
               toggleLockItem(contextMenu.id);
               setContextMenu(null);
             }}
-            className="w-full text-left px-4 py-2 hover:bg-gray-100 text-sm text-gray-700 flex items-center gap-2"
           >
-            <Lock size={14} />
-            <span>
-              {images.find((i) => i.id === contextMenu.id)?.isLocked ||
-              shapes.find((s) => s.id === contextMenu.id)?.isLocked ||
-              texts.find((t) => t.id === contextMenu.id)?.isLocked ||
-              lines.find((l) => l.id === contextMenu.id)?.isLocked
-                ? 'Unlock Element'
-                : 'Lock Element in Place'}
-            </span>
+            {images.find((i) => i.id === contextMenu.id)?.isLocked ||
+            shapes.find((s) => s.id === contextMenu.id)?.isLocked ||
+            texts.find((t) => t.id === contextMenu.id)?.isLocked ||
+            lines.find((l) => l.id === contextMenu.id)?.isLocked ? (
+              <>
+                <Unlock size={15} /> Unlock Element
+              </>
+            ) : (
+              <>
+                <Lock size={15} /> Lock Element
+              </>
+            )}
           </button>
           <button
+            className="w-full text-left px-4 py-2 text-sm text-gray-700 hover:bg-gray-100"
             onClick={() => {
               bringToFront(contextMenu.id);
               setContextMenu(null);
             }}
-            className="w-full text-left px-4 py-2 hover:bg-gray-100 text-sm text-gray-700"
           >
             Bring to Front
           </button>
           <button
+            className="w-full text-left px-4 py-2 text-sm text-gray-700 hover:bg-gray-100"
             onClick={() => {
               sendToBack(contextMenu.id);
               setContextMenu(null);
             }}
-            className="w-full text-left px-4 py-2 hover:bg-gray-100 text-sm text-gray-700"
           >
             Send to Back
           </button>
-          {images.find((i) => i.id === contextMenu.id) && (
-            <button
-              onClick={() => {
-                setImages((prev) =>
-                  prev.map((i) => {
-                    if (i.id === contextMenu.id) {
-                      const updated = { ...i, isPermanent: true, isLocked: true };
-                      const serialized = serializeMediaItem(updated);
-                      if (serialized) sendBoardOp({ type: 'upsert-media', item: serialized });
-                      return updated;
-                    }
-                    return i;
-                  })
-                );
-                setSelectedId(null);
-                setShouldSaveHistory(true);
-                setContextMenu(null);
-              }}
-              className="w-full text-left px-4 py-2 hover:bg-blue-50 text-sm text-blue-600 font-medium border-t border-gray-100"
-            >
-              Make Permanent Background
-            </button>
-          )}
+          <div className="h-px bg-gray-200 my-1" />
           <button
+            className="w-full text-left px-4 py-2 text-sm text-red-600 hover:bg-red-50 flex items-center gap-2"
             onClick={() => {
-              const idToRemove = contextMenu.id;
-              const media = images.find((i) => i.id === idToRemove);
-              if (media && media.mediaType === 'video' && media.element instanceof HTMLVideoElement) {
-                media.element.pause();
-              }
-              setLines((prev) => prev.filter((l) => l.id !== idToRemove));
-              setShapes((prev) => prev.filter((s) => s.id !== idToRemove));
-              setTexts((prev) => prev.filter((t) => t.id !== idToRemove));
-              setImages((prev) => prev.filter((i) => i.id !== idToRemove));
-              setSelectedId(null);
-              setShouldSaveHistory(true);
+              deleteSelected();
               setContextMenu(null);
-              sendBoardOp({ type: 'delete-item', id: idToRemove });
             }}
-            className="w-full text-left px-4 py-2 hover:bg-red-50 text-sm text-red-600 font-medium border-t border-gray-100"
           >
-            Delete
+            <Trash2 size={15} /> Delete
           </button>
         </div>
       )}
 
-      {/* Info Button */}
-      <div className="absolute bottom-4 right-4 z-20 flex flex-col items-end gap-2">
+      {/* Info Button and Panel */}
+      <div className="absolute bottom-4 right-4 z-20 flex flex-col items-end">
         {showInfo && (
-          <div className="bg-white p-4 rounded-xl shadow-lg border border-gray-200 text-sm w-80 mb-2">
-            <div className="flex justify-between items-center mb-3">
-              <h3 className="font-bold text-gray-800">Shortcuts & Controls</h3>
-              <button
-                onClick={() => setShowInfo(false)}
-                className="text-gray-500 hover:text-gray-800"
-              >
-                <X size={16} />
-              </button>
-            </div>
-            <ul className="space-y-1.5 text-gray-600 text-xs">
-              <li><strong>Host / Share (Users Icon):</strong> Host a live board & control guest write permissions</li>
-              <li><strong>Page Locked:</strong> Prevents accidental scrolling/panning while writing</li>
-              <li><strong>+100% VH / +100% VW:</strong> Expand static page height or width</li>
-              <li><strong>v, p, m, e:</strong> Select, Pen, Marker, Eraser</li>
-              <li><strong>r, t, l, a:</strong> Area Eraser, Text, Line, Rectangle</li>
-              <li><strong>c / s:</strong> Circle / Ellipse</li>
-              <li><strong>Double-Click Media:</strong> Play/Pause video or Lock/Unlock image/PDF</li>
-              <li><strong>Right-Click Element:</strong> Lock/Unlock, Reorder, or Delete</li>
-              <li><strong>Delete / Backspace:</strong> Delete selected object</li>
-              <li><strong>Ctrl/Cmd + z / y:</strong> Undo / Redo</li>
-              <li><strong>Shift + Click:</strong> Create ping arrow</li>
-            </ul>
+          <div className="bg-white/95 backdrop-blur shadow-xl rounded-xl p-4 mb-3 w-72 border border-gray-200 text-xs text-gray-600 space-y-2">
+            <h3 className="font-bold text-gray-800 text-sm border-b pb-1 mb-2">
+              Shortcuts & Controls
+            </h3>
+            <p>
+              <strong>Live Collaboration:</strong> Click the <strong>Users</strong> icon in the toolbar to host a room or join with a 6-digit code. New guests join in View-Only mode until the host enables write access.
+            </p>
+            <p>
+              <strong>Page Lock:</strong> Toggle the lock icon in the toolbar to freeze the page position while writing.
+            </p>
+            <p>
+              <strong>Expand Page:</strong> Click the down/right arrow icons in the toolbar to add +100% VH or +100% VW.
+            </p>
+            <p>
+              <strong>Media (PDF/Image/Video):</strong> Click once with Select (V) to show resize/lock controls, then drag. Double-click a video to play/pause.
+            </p>
+            <p>
+              <strong>Polygons:</strong> Select Rectangle tool, press <strong>3–9</strong> to set sides. Hold <strong>Ctrl</strong> for regular shapes.
+            </p>
           </div>
         )}
         <button
           onClick={() => setShowInfo(!showInfo)}
-          className="bg-white p-3 rounded-full shadow-lg border border-gray-200 hover:bg-gray-50 text-gray-600 transition-colors"
-          title="Shortcuts & Info"
+          className={`p-2.5 rounded-full shadow-lg border transition-colors ${
+            showInfo
+              ? 'bg-blue-600 text-white border-blue-600'
+              : 'bg-white/90 backdrop-blur text-gray-600 border-gray-200 hover:bg-gray-50'
+          }`}
+          title="Shortcuts & Instructions"
         >
-          <Info size={22} />
+          <Info size={20} />
         </button>
       </div>
     </div>

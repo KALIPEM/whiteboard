@@ -1,0 +1,195 @@
+{
+  "entities": {
+    "Room": {
+      "title": "Room",
+      "description": "A live collaborative whiteboard room session with host and global lock controls.",
+      "type": "object",
+      "properties": {
+        "roomCode": {
+          "type": "string",
+          "description": "Unique 6-character uppercase room code.",
+          "minLength": 4,
+          "maxLength": 8,
+          "pattern": "^[A-Z0-9]{4,8}$"
+        },
+        "hostId": {
+          "type": "string",
+          "description": "Persistent client identifier of the room host.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "allGuestsLocked": {
+          "type": "boolean",
+          "description": "Whether all guests are globally locked into view-only mode."
+        },
+        "pageCols": {
+          "type": "number",
+          "description": "Horizontal page multiplier in 100% VW increments."
+        },
+        "pageRows": {
+          "type": "number",
+          "description": "Vertical page multiplier in 100% VH increments."
+        },
+        "pingId": {
+          "type": "string",
+          "description": "ID of the latest shift-click pointer ping.",
+          "maxLength": 128
+        },
+        "pingX": {
+          "type": "number",
+          "description": "X coordinate of the latest pointer ping."
+        },
+        "pingY": {
+          "type": "number",
+          "description": "Y coordinate of the latest pointer ping."
+        },
+        "pingColor": {
+          "type": "string",
+          "description": "Color of the latest pointer ping.",
+          "maxLength": 32
+        },
+        "clearedAt": {
+          "type": "number",
+          "description": "Epoch timestamp of the last full board clear."
+        },
+        "updatedAt": {
+          "type": "number",
+          "description": "Epoch timestamp of the last room metadata update."
+        }
+      },
+      "required": [
+        "roomCode",
+        "hostId",
+        "allGuestsLocked",
+        "pageCols",
+        "pageRows",
+        "pingId",
+        "pingX",
+        "pingY",
+        "pingColor",
+        "clearedAt",
+        "updatedAt"
+      ]
+    },
+    "Participant": {
+      "title": "Participant",
+      "description": "A participant connected to a live whiteboard room with real-time cursor and write permission state.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "Unique participant identifier.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "name": {
+          "type": "string",
+          "description": "Display name shown in participant list and live cursor.",
+          "minLength": 1,
+          "maxLength": 32
+        },
+        "color": {
+          "type": "string",
+          "description": "Cursor and avatar badge hex color.",
+          "minLength": 1,
+          "maxLength": 32
+        },
+        "isHost": {
+          "type": "boolean",
+          "description": "True if this participant is the host of the room."
+        },
+        "canWrite": {
+          "type": "boolean",
+          "description": "True if the host has granted write access to this participant."
+        },
+        "kicked": {
+          "type": "boolean",
+          "description": "True if the host has removed this participant from the session."
+        },
+        "cursorX": {
+          "type": "number",
+          "description": "Current X position of the participant cursor on the page."
+        },
+        "cursorY": {
+          "type": "number",
+          "description": "Current Y position of the participant cursor on the page."
+        },
+        "cursorActive": {
+          "type": "boolean",
+          "description": "Whether the participant cursor is currently active on the board."
+        },
+        "lastSeen": {
+          "type": "number",
+          "description": "Epoch timestamp of the participant's latest activity."
+        }
+      },
+      "required": [
+        "userId",
+        "name",
+        "color",
+        "isHost",
+        "canWrite",
+        "kicked",
+        "cursorX",
+        "cursorY",
+        "cursorActive",
+        "lastSeen"
+      ]
+    },
+    "BoardElement": {
+      "title": "BoardElement",
+      "description": "An individual drawing stroke, shape, text annotation, or media item on a hosted whiteboard.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique element ID.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "kind": {
+          "type": "string",
+          "description": "Category of whiteboard element.",
+          "enum": ["line", "shape", "text", "media"],
+          "minLength": 4,
+          "maxLength": 16
+        },
+        "payload": {
+          "type": "string",
+          "description": "Serialized element geometry and style attributes.",
+          "minLength": 2,
+          "maxLength": 900000
+        },
+        "updatedBy": {
+          "type": "string",
+          "description": "Participant userId who created or last modified the element.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "updatedAt": {
+          "type": "number",
+          "description": "Epoch timestamp of the element mutation."
+        }
+      },
+      "required": ["id", "kind", "payload", "updatedBy", "updatedAt"]
+    }
+  },
+  "firestore": {
+    "/rooms/{roomCode}": {
+      "schema": "Room",
+      "description": "Stores live whiteboard room metadata, page expansion bounds, and global guest lock state."
+    },
+    "/rooms/{roomCode}/participants/{participantId}": {
+      "schema": "Participant",
+      "description": "Stores active participants, their view/write permissions, kick status, and live cursor coordinates."
+    },
+    "/rooms/{roomCode}/elements/{elementId}": {
+      "schema": "BoardElement",
+      "description": "Stores individual strokes, shapes, text boxes, and images/PDF pages for the room."
+    }
+  }
+}

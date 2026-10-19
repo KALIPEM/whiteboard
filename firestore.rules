@@ -1,0 +1,164 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global default-deny safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isValidRoomCode(code) {
+      return code is string && code.size() >= 4 && code.size() <= 8 && code.matches('^[A-Z0-9]{4,8}$');
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidRoom(data) {
+      return data.keys().hasAll([
+          'roomCode', 'hostId', 'allGuestsLocked', 'pageCols', 'pageRows',
+          'pingId', 'pingX', 'pingY', 'pingColor', 'clearedAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'roomCode', 'hostId', 'allGuestsLocked', 'pageCols', 'pageRows',
+          'pingId', 'pingX', 'pingY', 'pingColor', 'clearedAt', 'updatedAt'
+        ])
+        && isValidRoomCode(data.roomCode)
+        && isValidId(data.hostId)
+        && data.allGuestsLocked is bool
+        && data.pageCols is number && data.pageCols >= 1 && data.pageCols <= 20
+        && data.pageRows is number && data.pageRows >= 1 && data.pageRows <= 20
+        && data.pingId is string && data.pingId.size() <= 128
+        && data.pingX is number
+        && data.pingY is number
+        && data.pingColor is string && data.pingColor.size() <= 32
+        && data.clearedAt is number
+        && data.updatedAt is number;
+    }
+
+    function isValidParticipant(data) {
+      return data.keys().hasAll([
+          'userId', 'name', 'color', 'isHost', 'canWrite',
+          'kicked', 'cursorX', 'cursorY', 'cursorActive', 'lastSeen'
+        ])
+        && data.keys().hasOnly([
+          'userId', 'name', 'color', 'isHost', 'canWrite',
+          'kicked', 'cursorX', 'cursorY', 'cursorActive', 'lastSeen'
+        ])
+        && isValidId(data.userId)
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 32
+        && data.color is string && data.color.size() >= 1 && data.color.size() <= 32
+        && data.isHost is bool
+        && data.canWrite is bool
+        && data.kicked is bool
+        && data.cursorX is number
+        && data.cursorY is number
+        && data.cursorActive is bool
+        && data.lastSeen is number;
+    }
+
+    function isValidBoardElement(data) {
+      return data.keys().hasAll(['id', 'kind', 'payload', 'updatedBy', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'kind', 'payload', 'updatedBy', 'updatedAt'])
+        && isValidId(data.id)
+        && data.kind is string && data.kind.size() >= 4 && data.kind.size() <= 16
+        && data.kind in ['line', 'shape', 'text', 'media']
+        && data.payload is string && data.payload.size() >= 2 && data.payload.size() <= 900000
+        && isValidId(data.updatedBy)
+        && data.updatedAt is number;
+    }
+
+    function canParticipantWrite(roomCode, userId) {
+      let roomDoc = get(/databases/$(database)/documents/rooms/$(roomCode));
+      let partDoc = get(/databases/$(database)/documents/rooms/$(roomCode)/participants/$(userId));
+      return roomDoc != null
+        && partDoc != null
+        && partDoc.data.kicked == false
+        && (
+          partDoc.data.isHost == true
+          || (roomDoc.data.allGuestsLocked == false && partDoc.data.canWrite == true)
+        );
+    }
+
+    match /test/connection {
+      allow get: if true;
+    }
+
+    match /rooms/{roomCode} {
+      allow get: if isValidRoomCode(roomCode);
+
+      allow create: if isValidRoomCode(roomCode)
+        && isValidRoom(incoming())
+        && incoming().roomCode == roomCode;
+
+      allow update: if isValidRoomCode(roomCode)
+        && isValidRoom(incoming())
+        && incoming().roomCode == existing().roomCode
+        && incoming().hostId == existing().hostId
+        && (
+          // Action: Host global guest lock toggle
+          incoming().diff(existing()).affectedKeys().hasOnly(['allGuestsLocked', 'updatedAt'])
+          // Action: Page expansion
+          || incoming().diff(existing()).affectedKeys().hasOnly(['pageCols', 'pageRows', 'updatedAt'])
+          // Action: Pointer ping
+          || incoming().diff(existing()).affectedKeys().hasOnly(['pingId', 'pingX', 'pingY', 'pingColor', 'updatedAt'])
+          // Action: Clear board
+          || incoming().diff(existing()).affectedKeys().hasOnly(['clearedAt', 'updatedAt'])
+        );
+
+      match /participants/{participantId} {
+        allow get: if isValidRoomCode(roomCode) && isValidId(participantId);
+        allow list: if isValidRoomCode(roomCode) && existing().userId is string && existing().userId.size() <= 128;
+
+        allow create: if isValidRoomCode(roomCode)
+          && isValidId(participantId)
+          && isValidParticipant(incoming())
+          && incoming().userId == participantId
+          && exists(/databases/$(database)/documents/rooms/$(roomCode));
+
+        allow update: if isValidRoomCode(roomCode)
+          && isValidId(participantId)
+          && isValidParticipant(incoming())
+          && incoming().userId == existing().userId
+          && incoming().isHost == existing().isHost
+          && (
+            // Action: Cursor or heartbeat update by participant
+            incoming().diff(existing()).affectedKeys().hasOnly(['name', 'color', 'cursorX', 'cursorY', 'cursorActive', 'lastSeen'])
+            // Action: Host toggling write permission or kicking participant
+            || incoming().diff(existing()).affectedKeys().hasOnly(['canWrite', 'kicked', 'lastSeen'])
+          );
+      }
+
+      match /elements/{elementId} {
+        allow get: if isValidRoomCode(roomCode) && isValidId(elementId);
+        allow list: if isValidRoomCode(roomCode) && existing().id is string && existing().id.size() <= 128;
+
+        allow create: if isValidRoomCode(roomCode)
+          && isValidId(elementId)
+          && isValidBoardElement(incoming())
+          && incoming().id == elementId
+          && canParticipantWrite(roomCode, incoming().updatedBy);
+
+        allow update: if isValidRoomCode(roomCode)
+          && isValidId(elementId)
+          && isValidBoardElement(incoming())
+          && incoming().id == existing().id
+          && incoming().kind == existing().kind
+          && incoming().diff(existing()).affectedKeys().hasOnly(['payload', 'updatedBy', 'updatedAt'])
+          && canParticipantWrite(roomCode, incoming().updatedBy);
+
+        allow delete: if isValidRoomCode(roomCode)
+          && isValidId(elementId)
+          && exists(/databases/$(database)/documents/rooms/$(roomCode));
+      }
+    }
+  }
+}
